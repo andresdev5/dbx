@@ -8,7 +8,7 @@ mod web_grants;
 mod web_users;
 pub use type_execution_receipts::{TypeExecutionBinding, TypeRecoveryContext};
 pub use web_grants::{
-    builtin_role_id, builtin_roles, AuthzSnapshot, DataRole, StoredGrant, UserGroup, GRANT_INVALID, GRANT_NOT_FOUND,
+    builtin_role_id, builtin_roles, AuthzSnapshot, ConnectionAuthzPolicy, DataRole, StoredGrant, UserGroup, GRANT_INVALID, GRANT_NOT_FOUND,
     GROUP_NAME_TAKEN, GROUP_NOT_FOUND, ROLE_IN_USE, ROLE_NAME_TAKEN, ROLE_NOT_FOUND,
 };
 pub use web_users::{NewWebUser, WebSession, WebUser, LAST_ADMIN, USERNAME_TAKEN, USER_NOT_FOUND};

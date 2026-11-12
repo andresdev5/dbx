@@ -52,6 +52,14 @@ pub struct StoredGrant {
 pub struct AuthzSnapshot {
     pub grants: Vec<Grant>,
     pub memberships: HashMap<String, Vec<String>>,
+    pub strict_functions: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectionAuthzPolicy {
+    pub connection_id: String,
+    pub strict_function_mode: bool,
+    pub function_allowlist: Vec<String>,
 }
 
 pub(super) const WEB_GRANT_SCHEMA_STATEMENTS: &[&str] = &[
@@ -94,7 +102,34 @@ pub(super) const WEB_GRANT_SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_grants_principal ON grants(principal_kind, principal_id)",
     "CREATE INDEX IF NOT EXISTS idx_grants_connection ON grants(connection_id)",
     "CREATE INDEX IF NOT EXISTS idx_user_group_members_user ON user_group_members(user_id)",
+    "CREATE TABLE IF NOT EXISTS connection_authz_policies (
+        connection_id TEXT PRIMARY KEY,
+        strict_function_mode INTEGER NOT NULL DEFAULT 0,
+        function_allowlist TEXT NOT NULL DEFAULT '[]'
+    )",
 ];
+
+fn load_policies(conn: &rusqlite::Connection) -> Result<Vec<ConnectionAuthzPolicy>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT connection_id, strict_function_mode, function_allowlist FROM connection_authz_policies \
+             ORDER BY connection_id",
+        )
+        .map_err(sql_error)?;
+    let policies = statement
+        .query_map([], |row| {
+            let allowlist: String = row.get(2)?;
+            Ok(ConnectionAuthzPolicy {
+                connection_id: row.get(0)?,
+                strict_function_mode: row.get::<_, i64>(1)? != 0,
+                function_allowlist: serde_json::from_str(&allowlist).unwrap_or_default(),
+            })
+        })
+        .map_err(sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_error);
+    policies
+}
 
 pub fn builtin_role_id(role: BuiltinRole) -> String {
     let name = serde_json::to_value(role).ok().and_then(|value| value.as_str().map(str::to_string)).unwrap_or_default();
@@ -566,6 +601,24 @@ impl Storage {
         .await
     }
 
+    pub async fn list_connection_authz_policies(&self) -> Result<Vec<ConnectionAuthzPolicy>, String> {
+        self.with_conn(|conn| load_policies(conn)).await
+    }
+
+    pub async fn save_connection_authz_policy(&self, policy: ConnectionAuthzPolicy) -> Result<(), String> {
+        let allowlist = serde_json::to_string(&policy.function_allowlist).map_err(|error| error.to_string())?;
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO connection_authz_policies \
+                 (connection_id, strict_function_mode, function_allowlist) VALUES (?1, ?2, ?3)",
+                params![policy.connection_id, i64::from(policy.strict_function_mode), allowlist],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+        })
+        .await
+    }
+
     pub async fn authz_flag(&self, key: &str) -> Result<bool, String> {
         let key = format!("authz_flag:{key}");
         self.with_conn(move |conn| {
@@ -617,7 +670,14 @@ impl Storage {
                 let (user, group) = row.map_err(sql_error)?;
                 memberships.entry(user).or_default().push(group);
             }
-            Ok(AuthzSnapshot { grants, memberships })
+            let strict_functions = load_policies(conn)?
+                .into_iter()
+                .filter(|policy| policy.strict_function_mode)
+                .map(|policy| {
+                    (policy.connection_id, policy.function_allowlist.iter().map(|name| name.to_lowercase()).collect())
+                })
+                .collect();
+            Ok(AuthzSnapshot { grants, memberships, strict_functions })
         })
         .await
     }

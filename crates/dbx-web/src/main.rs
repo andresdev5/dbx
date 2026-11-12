@@ -738,6 +738,8 @@ async fn serve() -> Result<(), String> {
         .route("/admin/grants/save", post(routes::admin_access::save_grant))
         .route("/admin/grants/delete", post(routes::admin_access::delete_grant))
         .route("/admin/grants/effective", post(routes::admin_access::effective))
+        .route("/admin/connection-policies/list", post(routes::admin_access::list_connection_policies))
+        .route("/admin/connection-policies/save", post(routes::admin_access::save_connection_policy))
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))

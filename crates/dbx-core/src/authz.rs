@@ -74,6 +74,26 @@ fn schema_aware(database_type: DatabaseType) -> bool {
     database_type == DatabaseType::SqlServer || is_postgres_family(database_type)
 }
 
+pub const STANDARD_FUNCTIONS: &[&str] = &[
+    "abs", "array_agg", "avg", "bit_length", "btrim", "ceil", "ceiling", "char_length", "character_length", "coalesce",
+    "concat", "concat_ws", "count", "cume_dist", "current_date", "current_time", "current_timestamp", "date",
+    "date_part", "date_trunc", "dateadd", "datediff", "datepart", "day", "dense_rank", "exp", "first_value", "floor",
+    "format", "greatest", "group_concat", "hour", "if", "ifnull", "iif", "initcap", "instr", "isnull", "json_agg",
+    "json_build_object", "json_extract", "json_object", "jsonb_agg", "jsonb_build_object", "lag", "last_value", "lead",
+    "least", "left", "len", "length", "ln", "localtime", "localtimestamp", "log", "log10", "lower", "lpad", "ltrim",
+    "max", "md5", "min", "minute", "mod", "month", "now", "nth_value", "ntile", "nullif", "nvl", "octet_length",
+    "percent_rank", "position", "power", "quarter", "rank", "regexp_replace", "repeat", "replace", "reverse", "right",
+    "round", "row_number", "rpad", "rtrim", "second", "sign", "split_part", "sqrt", "stddev", "string_agg", "strpos",
+    "substr", "substring", "sum", "to_char", "to_date", "to_number", "to_timestamp", "trim", "trunc", "upper",
+    "variance", "week", "year",
+];
+
+fn function_requires_execute(function: &str, allowlist: &[String]) -> bool {
+    let short = function.rsplit('.').next().unwrap_or(function);
+    !(STANDARD_FUNCTIONS.contains(&short)
+        || allowlist.iter().any(|allowed| allowed == function || allowed == short))
+}
+
 pub fn denial_message(decision: &Decision) -> Option<String> {
     let Decision::Deny(denial) = decision else {
         return None;
@@ -322,8 +342,17 @@ async fn authorize_statements(
         default_schema: default_schema(config.db_type),
         schema_aware: schema_aware(config.db_type),
     };
+    let strict_allowlist = state.authz.snapshot().strict_functions.get(&config.id).cloned();
     for sql in statements {
-        let requirement = classify_sql_operations(sql, config.db_type).resolve(&context);
+        let classified = classify_sql_operations(sql, config.db_type);
+        let mut requirement = classified.resolve(&context);
+        if let Some(allowlist) = &strict_allowlist {
+            if classified.functions.iter().any(|function| function_requires_execute(function, allowlist)) {
+                let mut resource = Resource::connection(config.id.clone());
+                resource.database = active_database.clone();
+                requirement.push(Need::within(resource, Operations::EXECUTE));
+            }
+        }
         if let Some(message) = denial_message(&permissions.authorize(&requirement)) {
             return Err(message);
         }
@@ -407,7 +436,7 @@ mod tests {
         for (user, group) in memberships {
             groups.entry(user.to_string()).or_default().push(group.to_string());
         }
-        state.authz.replace_snapshot(AuthzSnapshot { grants, memberships: groups });
+        state.authz.replace_snapshot(AuthzSnapshot { grants, memberships: groups, strict_functions: HashMap::new() });
         state.authz.set_enforced(true);
         state.authz.register_owner("ana-token", user("ana"));
         state.authz.register_owner("bob-token", user("bob"));
@@ -522,6 +551,37 @@ mod tests {
         .await;
         assert!(run_as(&state, "ana-token", "INSERT INTO orders(status) VALUES ('x')").await.is_ok());
         assert!(run_as(&state, "ana-token", "DELETE FROM orders").await.is_err());
+    }
+
+    async fn check_as_ana(state: &AppState, sql: &str) -> Result<(), String> {
+        with_credential_owner(Some("ana-token".into()), authorize_sql_for(state, CONNECTION, Some("main"), &[sql])).await
+    }
+
+    #[tokio::test]
+    async fn strict_function_mode_requires_execute_for_unknown_functions() {
+        let (_root, state) = state(false).await;
+        let reader = grant(
+            "r",
+            Subject::User("ana".into()),
+            Scope::Resource(Resource::connection(CONNECTION)),
+            Effect::Allow,
+            Operations::SELECT,
+        );
+        enforce(&state, vec![reader.clone()], &[]);
+        assert!(check_as_ana(&state, "SELECT audit_purge(1) FROM orders").await.is_ok());
+
+        let mut strict = HashMap::new();
+        strict.insert(CONNECTION.to_string(), vec!["safe_score".to_string()]);
+        state.authz.replace_snapshot(AuthzSnapshot {
+            grants: vec![reader],
+            memberships: HashMap::new(),
+            strict_functions: strict,
+        });
+        let denied = check_as_ana(&state, "SELECT audit_purge(1) FROM orders").await.unwrap_err();
+        assert!(denied.contains("EXECUTE"), "{denied}");
+        assert!(check_as_ana(&state, "SELECT lower(status), count(*) FROM orders GROUP BY 1").await.is_ok());
+        assert!(check_as_ana(&state, "SELECT safe_score(id) FROM orders").await.is_ok());
+        assert!(check_as_ana(&state, "SELECT * FROM orders").await.is_ok());
     }
 
     #[tokio::test]

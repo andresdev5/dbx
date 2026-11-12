@@ -117,6 +117,7 @@ mod tests {
                 expires_at: None,
             }],
             memberships: Default::default(),
+            strict_functions: Default::default(),
         });
         app.authz.set_enforced(true);
         app.authz.register_owner(
@@ -163,6 +164,7 @@ mod tests {
                 expires_at: None,
             }],
             memberships: Default::default(),
+            strict_functions: Default::default(),
         });
         app.authz.set_enforced(true);
         app.authz.register_owner(

@@ -124,6 +124,8 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/admin/grants/list", post(crate::routes::admin_access::list_grants))
         .route("/api/admin/grants/delete", post(crate::routes::admin_access::delete_grant))
         .route("/api/admin/grants/effective", post(crate::routes::admin_access::effective))
+        .route("/api/admin/connection-policies/list", post(crate::routes::admin_access::list_connection_policies))
+        .route("/api/admin/connection-policies/save", post(crate::routes::admin_access::save_connection_policy))
         .route("/api/connection/list", get(crate::routes::connection::load_connections))
         .route("/api/database-backups", post(crate::routes::scheduled_backup::command))
         .fallback(|| async { "handled" })
@@ -771,4 +773,27 @@ async fn existing_backups_are_migrated_to_system_access_once() {
     state.app.storage.delete_grant(&grants[0].id).await.unwrap();
     crate::routes::scheduled_backup::migrate_backup_access(&state, &service).await.unwrap();
     assert!(state.app.storage.list_grants().await.unwrap().is_empty(), "the migration runs only once");
+}
+
+
+#[tokio::test]
+async fn connection_policies_are_validated_and_listed() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    save_sqlite_connection(&state, "ventas", directory.path()).await;
+    state.app.configs.write().await.extend(
+        state.app.storage.load_connections().await.unwrap().into_iter().map(|config| (config.id.clone(), config)),
+    );
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let save = |body: Value| server.post("/api/admin/connection-policies/save", Some(&admin), body);
+    let invalid = save(json!({ "connection_id": "ventas", "strict_function_mode": true, "function_allowlist": ["drop table;"] })).await;
+    assert_eq!(invalid.body["error"], "function_allowlist_invalid");
+    let unknown = save(json!({ "connection_id": "nope", "strict_function_mode": true })).await;
+    assert_eq!(unknown.body["error"], "connection_not_found");
+    let saved = save(json!({ "connection_id": "ventas", "strict_function_mode": true, "function_allowlist": [" Sales.Score ", "sales.score", "fmt"] })).await;
+    assert_eq!(saved.body["function_allowlist"], json!(["fmt", "sales.score"]));
+    let listed = server.post("/api/admin/connection-policies/list", Some(&admin), json!({})).await;
+    assert_eq!(listed.body[0]["strict_function_mode"], true);
+    assert_eq!(state.app.authz.snapshot().strict_functions.get("ventas"), Some(&vec!["fmt".to_string(), "sales.score".to_string()]));
 }

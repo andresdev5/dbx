@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use dbx_authz::{Effect, Operations, Principal, Resource, Scope, Subject};
 use dbx_core::storage::{
-    DataRole, StoredGrant, UserGroup, GRANT_INVALID, GRANT_NOT_FOUND, GROUP_NAME_TAKEN, GROUP_NOT_FOUND, ROLE_IN_USE,
+    ConnectionAuthzPolicy, DataRole, StoredGrant, UserGroup, GRANT_INVALID, GRANT_NOT_FOUND, GROUP_NAME_TAKEN, GROUP_NOT_FOUND, ROLE_IN_USE,
     ROLE_NAME_TAKEN, ROLE_NOT_FOUND,
 };
 use serde::{Deserialize, Serialize};
@@ -486,6 +486,69 @@ pub async fn effective(
         implicit_admin: principal.is_admin(),
         connection_operations: operation_names(permissions.operations_at(&Resource::connection(config.id.clone()))),
         rules,
+    })
+    .into_response())
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ConnectionPolicyView {
+    pub connection_id: String,
+    pub strict_function_mode: bool,
+    #[serde(default)]
+    pub function_allowlist: Vec<String>,
+}
+
+const MAX_ALLOWLIST_ENTRIES: usize = 500;
+
+fn valid_function_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 128
+        && name.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '.' | '$'))
+}
+
+pub async fn list_connection_policies(State(state): State<Arc<WebState>>, _admin: CurrentUser) -> AccessResult {
+    let policies = state.app.storage.list_connection_authz_policies().await.map_err(AccessError::storage)?;
+    let views: Vec<ConnectionPolicyView> = policies
+        .into_iter()
+        .map(|policy| ConnectionPolicyView {
+            connection_id: policy.connection_id,
+            strict_function_mode: policy.strict_function_mode,
+            function_allowlist: policy.function_allowlist,
+        })
+        .collect();
+    Ok(Json(views).into_response())
+}
+
+pub async fn save_connection_policy(
+    State(state): State<Arc<WebState>>,
+    _admin: CurrentUser,
+    Json(body): Json<ConnectionPolicyView>,
+) -> AccessResult {
+    if !state.app.configs.read().await.contains_key(&body.connection_id) {
+        return Err(AccessError::new(StatusCode::NOT_FOUND, "connection_not_found"));
+    }
+    let mut allowlist: Vec<String> = body
+        .function_allowlist
+        .iter()
+        .map(|name| name.trim().to_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    allowlist.sort();
+    allowlist.dedup();
+    if allowlist.len() > MAX_ALLOWLIST_ENTRIES || !allowlist.iter().all(|name| valid_function_name(name)) {
+        return Err(AccessError::new(StatusCode::BAD_REQUEST, "function_allowlist_invalid"));
+    }
+    let policy = ConnectionAuthzPolicy {
+        connection_id: body.connection_id.clone(),
+        strict_function_mode: body.strict_function_mode,
+        function_allowlist: allowlist.clone(),
+    };
+    state.app.storage.save_connection_authz_policy(policy).await.map_err(AccessError::storage)?;
+    reload(&state).await?;
+    Ok(Json(ConnectionPolicyView {
+        connection_id: body.connection_id,
+        strict_function_mode: body.strict_function_mode,
+        function_allowlist: allowlist,
     })
     .into_response())
 }
