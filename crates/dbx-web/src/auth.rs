@@ -1,36 +1,56 @@
 use std::sync::Arc;
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use axum::extract::State;
-use axum::http::{Request, StatusCode};
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use dbx_authz::PlatformRole;
+use dbx_core::storage::USERNAME_TAKEN;
 use serde::{Deserialize, Serialize};
 
 use crate::captcha::CAPTCHA_TTL;
-use crate::state::WebState;
+use crate::identity::{burn_verification, check_new_password, hash_password, normalize_username, verify_password};
+use crate::request_context::{is_cross_site, ClientInfo};
+use crate::sessions::{hash_token, now_millis, SessionUser};
+use crate::state::{LoginThrottle, WebState};
+
+pub const SESSION_EXPIRED: &str = "session_expired";
+pub const SETUP_REQUIRED: &str = "setup_required";
+pub const PASSWORD_CHANGE_REQUIRED: &str = "password_change_required";
+pub const INVALID_CREDENTIALS: &str = "invalid_credentials";
+pub const CROSS_SITE_REQUEST: &str = "cross_site_request";
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
+    #[serde(default)]
+    pub username: String,
     pub password: String,
-    /// Challenge id returned by `GET /auth/captcha`. Optional at the type level
-    /// so `auth::setup` can reuse this body; `auth::login` rejects a missing or
-    /// stale pair with `captcha_invalid`.
     #[serde(default)]
     pub captcha_id: Option<String>,
     #[serde(default)]
     pub captcha_code: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct SetupRequest {
+    #[serde(default)]
+    pub setup_token: String,
+    #[serde(default)]
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Deserialize, Default)]
+pub struct CaptchaQuery {
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct CaptchaResponse {
     pub id: String,
-    /// `data:image/png;base64,...` so the client needs no second request and
-    /// the challenge cannot be cached by an intermediary.
     pub image: String,
     pub expires_in: u64,
 }
@@ -41,22 +61,49 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AuthUserView {
+    pub id: String,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub role: PlatformRole,
+    pub must_change_password: bool,
+}
+
+impl From<&SessionUser> for AuthUserView {
+    fn from(user: &SessionUser) -> Self {
+        Self {
+            id: user.user_id.clone(),
+            username: user.username.clone(),
+            display_name: user.display_name.clone(),
+            role: user.role,
+            must_change_password: user.must_change_password,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct AuthCheckResponse {
     pub authenticated: bool,
     pub required: bool,
     pub setup_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<AuthUserView>,
 }
 
-const MAX_ATTEMPTS: u32 = 5;
-const LOCKOUT_SECS: u64 = 60;
+fn error_response(status: StatusCode, code: &str) -> Response {
+    (status, [("cache-control", "no-store")], Json(serde_json::json!({ "error": code }))).into_response()
+}
+
+fn rate_limited(wait: std::time::Duration) -> Response {
+    let remaining = wait.as_secs().max(1);
+    error_response(StatusCode::TOO_MANY_REQUESTS, &format!("Please try again in {remaining}s"))
+}
 
 fn session_cookie_path(state: &WebState) -> &str {
     state.public_base_path.as_str()
 }
 
-/// `Secure` is opt-in: LAN/HTTP deployments would otherwise never receive the
-/// session cookie back. Reverse-proxy TLS deployments set DBX_WEB_COOKIE_SECURE=1.
 fn cookie_secure_enabled() -> bool {
     static SECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SECURE.get_or_init(|| matches!(std::env::var("DBX_WEB_COOKIE_SECURE").ok().as_deref(), Some("1") | Some("true")))
@@ -65,6 +112,10 @@ fn cookie_secure_enabled() -> bool {
 pub(crate) fn session_cookie(state: &WebState, token: &str) -> String {
     let secure = if cookie_secure_enabled() { "; Secure" } else { "" };
     format!("dbx_session={token}; Path={}; HttpOnly; SameSite=Lax{secure}", session_cookie_path(state))
+}
+
+fn cleared_session_cookie(state: &WebState) -> String {
+    format!("dbx_session=; Path={}; HttpOnly; Max-Age=0", session_cookie_path(state))
 }
 
 fn api_path_suffix<'a>(path: &'a str, public_base_path: &str) -> Option<&'a str> {
@@ -91,14 +142,81 @@ pub(crate) fn middleware_api_path_suffix<'a>(path: &'a str, public_base_path: &s
     path.strip_prefix('/').filter(|suffix| !suffix.is_empty())
 }
 
-/// Issue a login challenge. Unauthenticated by design (it is the pre-login
-/// handshake), but bounded: `CaptchaStore` caps pending entries and expires
-/// them, so this endpoint cannot be turned into a memory sink.
-pub async fn captcha(State(state): State<Arc<WebState>>) -> Response {
-    // `auto` only asks for a challenge once an attempt has failed, and `off`
-    // never does, so the form decides from this response whether to show the
-    // field at all.
-    let failed_attempts = state.login_rate_limit.lock().await.fail_count;
+pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let cookie_header = headers.get("cookie")?.to_str().ok()?;
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if let Some(value) = pair.strip_prefix("dbx_session=") {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn forget_live_session(state: &WebState, token: &str) {
+    let removed = {
+        let mut sessions = state.sessions.write().await;
+        let removed = sessions.remove(token);
+        if removed {
+            dbx_core::query::pl_debug::pl_debug_revoke_web_owner_core(&state.app, token);
+        }
+        removed
+    };
+    if removed {
+        state.app.session_credentials.clear_owner(token);
+    }
+}
+
+async fn forget_live_sessions_by_hash(state: &WebState, token_hashes: &[String]) {
+    if token_hashes.is_empty() {
+        return;
+    }
+    let tokens: Vec<String> =
+        state.sessions.read().await.iter().filter(|token| token_hashes.contains(&hash_token(token))).cloned().collect();
+    for token in tokens {
+        forget_live_session(state, &token).await;
+    }
+}
+
+async fn start_session(state: &WebState, user: &dbx_core::storage::WebUser, client: &ClientInfo) -> Response {
+    let now = now_millis();
+    let created = state
+        .session_manager
+        .create(&state.app.storage, user, client.ip_string(), client.user_agent.clone(), now)
+        .await;
+    let (token, session_user) = match created {
+        Ok(created) => created,
+        Err(error) => {
+            log::error!("Failed to create a DBX Web session: {error}");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "session_unavailable");
+        }
+    };
+    if let Err(error) = state.app.storage.record_web_user_login(&user.id, now).await {
+        log::warn!("Failed to record the last login of '{}': {error}", user.username);
+    }
+    state.sessions.write().await.insert(token.clone());
+    let cookie = session_cookie(state, &token);
+    let view = AuthUserView::from(&session_user);
+    (
+        StatusCode::OK,
+        [("set-cookie", cookie.as_str()), ("cache-control", "no-store")],
+        Json(serde_json::json!({ "ok": true, "must_change_password": view.must_change_password, "user": view })),
+    )
+        .into_response()
+}
+
+pub async fn captcha(
+    State(state): State<Arc<WebState>>,
+    client: ClientInfo,
+    Query(query): Query<CaptchaQuery>,
+) -> Response {
+    let failed_attempts = {
+        let throttle = state.login_throttle.lock().await;
+        let by_user = query.username.as_deref().map_or(0, |name| throttle.failures(&LoginThrottle::user_key(name)));
+        throttle.failures(&LoginThrottle::ip_key(client.ip)).max(by_user)
+    };
     let mode = *state.captcha_mode.read().await;
     if !mode.requires_challenge(failed_attempts) {
         return StatusCode::NO_CONTENT.into_response();
@@ -113,258 +231,337 @@ pub async fn captcha(State(state): State<Arc<WebState>>) -> Response {
         .into_response()
 }
 
-pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginRequest>) -> Result<Response, StatusCode> {
-    let hash_guard = state.password_hash.read().await;
-    let hash_str = match hash_guard.as_deref() {
-        // No password configured: nothing to authenticate against. Answer
-        // explicitly instead of an ok:true that reads as "authenticated" —
-        // the API remains locked by the middleware until setup completes.
-        Some(h) => h.to_string(),
-        None => {
-            return Ok((StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "setup_required"}))).into_response());
-        }
-    };
-    drop(hash_guard);
+pub async fn login(State(state): State<Arc<WebState>>, client: ClientInfo, Json(body): Json<LoginRequest>) -> Response {
+    if state.password_disabled {
+        return error_response(StatusCode::FORBIDDEN, "login_not_required");
+    }
+    if !state.users_configured() {
+        return error_response(StatusCode::FORBIDDEN, SETUP_REQUIRED);
+    }
 
-    // Captcha gate, when the configured mode demands one. It runs before the
-    // rate-limit bookkeeping and the argon2 verification on purpose: a wrong or
-    // missing challenge must not consume the password lockout budget (otherwise
-    // five bogus captchas would lock the administrator out), and a bot must not
-    // be able to spend our hashing CPU without solving an image first. `verify`
-    // consumes the challenge either way, so the same image can never be
-    // replayed.
-    let failed_attempts = state.login_rate_limit.lock().await.fail_count;
+    let ip_key = LoginThrottle::ip_key(client.ip);
+    let user_key = LoginThrottle::user_key(&body.username);
+    let (failed_attempts, locked_for) = {
+        let throttle = state.login_throttle.lock().await;
+        let now = std::time::Instant::now();
+        let failed = throttle.failures(&ip_key).max(throttle.failures(&user_key));
+        let locked = throttle.locked_for(&ip_key, now).max(throttle.locked_for(&user_key, now));
+        (failed, locked)
+    };
+
     if state.captcha_mode.read().await.requires_challenge(failed_attempts) {
         let captcha_ok = state
             .captchas
             .verify(body.captcha_id.as_deref().unwrap_or_default(), body.captcha_code.as_deref().unwrap_or_default());
         if !captcha_ok {
-            return Ok((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "captcha_invalid"}))).into_response());
+            return error_response(StatusCode::BAD_REQUEST, "captcha_invalid");
         }
     }
 
-    // Check rate limit
-    {
-        let rl = state.login_rate_limit.lock().await;
-        if let Some(locked_until) = rl.locked_until {
-            if locked_until > std::time::Instant::now() {
-                let remaining = (locked_until - std::time::Instant::now()).as_secs();
-                return Ok((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({"error": format!("Please try again in {remaining}s")})),
-                )
-                    .into_response());
-            }
+    if let Some(remaining) = locked_for {
+        return rate_limited(remaining);
+    }
+
+    let user = match normalize_username(&body.username) {
+        Ok(username) => state.app.storage.find_web_user_by_username(&username).await.unwrap_or_else(|error| {
+            log::error!("Failed to look up a DBX Web user: {error}");
+            None
+        }),
+        Err(_) => None,
+    };
+    let authenticated = match &user {
+        Some(user) => verify_password(&body.password, &user.password_hash) && user.active,
+        None => {
+            burn_verification(&body.password);
+            false
         }
+    };
+
+    let mut throttle = state.login_throttle.lock().await;
+    if !authenticated {
+        let now = std::time::Instant::now();
+        throttle.record_failure(&ip_key, now);
+        throttle.record_failure(&user_key, now);
+        return error_response(StatusCode::UNAUTHORIZED, INVALID_CREDENTIALS);
     }
+    throttle.clear(&ip_key);
+    throttle.clear(&user_key);
+    drop(throttle);
 
-    let parsed_hash = PasswordHash::new(&hash_str).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if Argon2::default().verify_password(body.password.as_bytes(), &parsed_hash).is_err() {
-        let mut rl = state.login_rate_limit.lock().await;
-        rl.fail_count += 1;
-        if rl.fail_count >= MAX_ATTEMPTS {
-            rl.locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(LOCKOUT_SECS));
-            rl.fail_count = 0;
-        }
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    // Success — reset rate limit
-    {
-        let mut rl = state.login_rate_limit.lock().await;
-        rl.fail_count = 0;
-        rl.locked_until = None;
-    }
-
-    let token = uuid::Uuid::new_v4().to_string();
-    state.sessions.write().await.insert(token.clone());
-
-    let cookie = session_cookie(&state, &token);
-    Ok((StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response())
+    let Some(user) = user else {
+        return error_response(StatusCode::UNAUTHORIZED, INVALID_CREDENTIALS);
+    };
+    start_session(&state, &user, &client).await
 }
 
-pub async fn setup(State(state): State<Arc<WebState>>, Json(body): Json<LoginRequest>) -> Result<Response, StatusCode> {
-    if state.password_disabled {
-        return Err(StatusCode::FORBIDDEN);
+pub async fn setup(State(state): State<Arc<WebState>>, client: ClientInfo, Json(body): Json<SetupRequest>) -> Response {
+    static SETUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    if state.password_disabled || state.users_configured() {
+        return error_response(StatusCode::FORBIDDEN, "setup_not_available");
     }
-
-    // Only allow setup when no password is configured
-    if state.password_hash.read().await.is_some() {
-        return Err(StatusCode::FORBIDDEN);
+    let ip_key = LoginThrottle::ip_key(client.ip);
+    if let Some(remaining) = state.login_throttle.lock().await.locked_for(&ip_key, std::time::Instant::now()) {
+        return rate_limited(remaining);
     }
-
-    if body.password.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+    if !state.setup_token.verify(body.setup_token.trim()) {
+        state.login_throttle.lock().await.record_failure(&ip_key, std::time::Instant::now());
+        return error_response(StatusCode::FORBIDDEN, "setup_token_invalid");
     }
+    let username = match normalize_username(&body.username) {
+        Ok(username) => username,
+        Err(code) => return error_response(StatusCode::BAD_REQUEST, code),
+    };
+    if let Err(code) = check_new_password(&body.password) {
+        return error_response(StatusCode::BAD_REQUEST, code);
+    }
+    let password_hash = match hash_password(&body.password) {
+        Ok(hash) => hash,
+        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "setup_failed"),
+    };
 
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
-        .hash_password(body.password.as_bytes(), &salt)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .to_string();
+    let _guard = SETUP_LOCK.lock().await;
+    match state.app.storage.count_web_users().await {
+        Ok(0) => {}
+        Ok(_) => return error_response(StatusCode::FORBIDDEN, "setup_not_available"),
+        Err(error) => {
+            log::error!("Failed to inspect DBX Web users during setup: {error}");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "setup_failed");
+        }
+    }
+    let created = state
+        .app
+        .storage
+        .create_web_user(
+            dbx_core::storage::NewWebUser {
+                username,
+                display_name: None,
+                password_hash,
+                role: PlatformRole::Admin,
+                must_change_password: false,
+            },
+            now_millis(),
+        )
+        .await;
+    let user = match created {
+        Ok(user) => user,
+        Err(error) if error == USERNAME_TAKEN => return error_response(StatusCode::FORBIDDEN, "setup_not_available"),
+        Err(error) => {
+            log::error!("Failed to create the first DBX Web administrator: {error}");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "setup_failed");
+        }
+    };
+    state.users_configured.store(true, std::sync::atomic::Ordering::Release);
+    state.setup_token.clear();
+    log::info!("Created the first DBX Web administrator '{}'", user.username);
 
-    // Save to database
-    state.app.storage.save_password_hash(&hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Update in-memory state
-    *state.password_hash.write().await = Some(hash);
     if state.migration_ready.load(std::sync::atomic::Ordering::Acquire) {
         if let Err(error) = state.web_mcp.reload(&state.app.storage, true).await {
-            log::error!("Web MCP remained disabled after password setup: {error}");
+            log::error!("Web MCP remained disabled after the first administrator was created: {error}");
         }
     }
-
-    // Auto-login: create session
-    let token = uuid::Uuid::new_v4().to_string();
-    state.sessions.write().await.insert(token.clone());
-
-    let cookie = session_cookie(&state, &token);
-    Ok((StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response())
+    start_session(&state, &user, &client).await
 }
 
-pub async fn check(State(state): State<Arc<WebState>>, req: Request<axum::body::Body>) -> Json<AuthCheckResponse> {
+pub async fn check(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Json<AuthCheckResponse> {
     if state.password_disabled {
-        return Json(AuthCheckResponse { authenticated: true, required: false, setup_required: false });
+        return Json(AuthCheckResponse { authenticated: true, required: false, setup_required: false, user: None });
     }
-    let has_password = state.password_hash.read().await.is_some();
-    if !has_password {
-        return Json(AuthCheckResponse { authenticated: false, required: false, setup_required: true });
+    if !state.users_configured() {
+        state.setup_token.ensure_issued();
+        return Json(AuthCheckResponse { authenticated: false, required: false, setup_required: true, user: None });
     }
-    let authenticated = match extract_session_token(&req) {
-        Some(token) => state.sessions.read().await.contains(&token),
-        None => false,
+    let user = match session_token_from_headers(&headers) {
+        Some(token) => state.session_manager.validate(&state.app.storage, &token, now_millis()).await,
+        None => None,
     };
-    Json(AuthCheckResponse { authenticated, required: true, setup_required: false })
+    Json(AuthCheckResponse {
+        authenticated: user.is_some(),
+        required: true,
+        setup_required: false,
+        user: user.as_ref().map(AuthUserView::from),
+    })
 }
 
 pub async fn change_password(
     State(state): State<Arc<WebState>>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
-) -> Result<Response, StatusCode> {
-    // Session-bound: this endpoint used to sit outside the auth middleware,
-    // giving unauthenticated callers an unlimited online guess at the admin
-    // password with none of login's lockout. It now requires a live session
-    // (defense in depth — the middleware gates it too) and, after a successful
-    // change, revokes every OTHER session so a stolen old cookie cannot survive
-    // a credential rotation.
-    let current_token = session_token_from_headers(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    if !state.sessions.read().await.contains(&current_token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let hash_guard = state.password_hash.read().await;
-    let hash_str = match hash_guard.as_deref() {
-        Some(h) => h.to_string(),
-        None => return Err(StatusCode::BAD_REQUEST),
+) -> Response {
+    let Some(token) = session_token_from_headers(&headers) else {
+        return error_response(StatusCode::UNAUTHORIZED, SESSION_EXPIRED);
     };
-    drop(hash_guard);
-
-    if body.new_password.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+    let Some(session_user) = state.session_manager.validate(&state.app.storage, &token, now_millis()).await else {
+        return error_response(StatusCode::UNAUTHORIZED, SESSION_EXPIRED);
+    };
+    let user_key = LoginThrottle::user_key(&session_user.username);
+    if let Some(remaining) = state.login_throttle.lock().await.locked_for(&user_key, std::time::Instant::now()) {
+        return rate_limited(remaining);
     }
-
-    let parsed_hash = PasswordHash::new(&hash_str).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if Argon2::default().verify_password(body.old_password.as_bytes(), &parsed_hash).is_err() {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let salt = SaltString::generate(&mut OsRng);
-    let new_hash = Argon2::default()
-        .hash_password(body.new_password.as_bytes(), &salt)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .to_string();
-
-    state.app.storage.save_password_hash(&new_hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    *state.password_hash.write().await = Some(new_hash);
-
-    // Rotation revokes sibling sessions; only the caller stays logged in.
-    {
-        let mut sessions = state.sessions.write().await;
-        for token in sessions.iter().filter(|token| **token != current_token) {
-            dbx_core::query::pl_debug::pl_debug_revoke_web_owner_core(&state.app, token);
+    let user = match state.app.storage.find_web_user(&session_user.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, SESSION_EXPIRED),
+        Err(error) => {
+            log::error!("Failed to load a DBX Web user: {error}");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "change_password_failed");
         }
-        sessions.retain(|token| *token == current_token);
+    };
+    if !verify_password(&body.old_password, &user.password_hash) {
+        state.login_throttle.lock().await.record_failure(&user_key, std::time::Instant::now());
+        return error_response(StatusCode::UNAUTHORIZED, "old_password_invalid");
     }
+    if let Err(code) = check_new_password(&body.new_password) {
+        return error_response(StatusCode::BAD_REQUEST, code);
+    }
+    if body.new_password == body.old_password {
+        return error_response(StatusCode::BAD_REQUEST, "password_unchanged");
+    }
+    let now = now_millis();
+    let updated = match hash_password(&body.new_password) {
+        Ok(hash) => state.app.storage.set_web_user_password(&user.id, &hash, false, now).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = updated {
+        log::error!("Failed to change the password of '{}': {error}", user.username);
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "change_password_failed");
+    }
+    state.login_throttle.lock().await.clear(&user_key);
 
-    Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
+    let revoked = state
+        .session_manager
+        .revoke_user(&state.app.storage, &user.id, Some(&session_user.token_hash), now)
+        .await
+        .unwrap_or_else(|error| {
+            log::error!("Failed to revoke the other sessions of '{}': {error}", user.username);
+            Vec::new()
+        });
+    forget_live_sessions_by_hash(&state, &revoked).await;
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
-pub async fn logout(State(state): State<Arc<WebState>>, req: Request<axum::body::Body>) -> Response {
-    if let Some(token) = extract_session_token(&req) {
-        {
-            let mut sessions = state.sessions.write().await;
-            sessions.remove(&token);
-            dbx_core::query::pl_debug::pl_debug_revoke_web_owner_core(&state.app, &token);
-        }
-        // 登出只清除当前登录会话的临时密码，不影响其他会话与桌面端凭据。
-        state.app.session_credentials.clear_owner(&token);
-    }
-    let cookie = format!("dbx_session=; Path={}; HttpOnly; Max-Age=0", session_cookie_path(&state));
-    (StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response()
-}
-
-pub fn session_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
-    let cookie_header = headers.get("cookie")?.to_str().ok()?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some(value) = pair.strip_prefix("dbx_session=") {
-            if !value.is_empty() {
-                return Some(value.to_string());
+pub async fn logout(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+    if let Some(token) = session_token_from_headers(&headers) {
+        if !state.password_disabled {
+            if let Err(error) = state.session_manager.revoke(&state.app.storage, &token, now_millis()).await {
+                log::warn!("Failed to revoke a DBX Web session: {error}");
             }
         }
+        forget_live_session(&state, &token).await;
     }
-    None
+    let cookie = cleared_session_cookie(&state);
+    (StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
-fn extract_session_token<B>(req: &Request<B>) -> Option<String> {
-    session_token_from_headers(req.headers())
+fn is_bootstrap_route(suffix: &str) -> bool {
+    matches!(suffix, "auth/login" | "auth/setup" | "auth/check" | "auth/captcha")
+}
+
+fn allowed_while_password_change_required(suffix: &str) -> bool {
+    matches!(suffix, "auth/change-password" | "auth/logout")
 }
 
 pub async fn auth_middleware(
     State(state): State<Arc<WebState>>,
-    req: Request<axum::body::Body>,
+    mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    // Only the bootstrap auth endpoints are reachable without a session —
-    // login/setup/check. change-password and logout require one: change-password
-    // must not be an unauthenticated password oracle.
-    let api_suffix = middleware_api_path_suffix(req.uri().path(), &state.public_base_path);
-    if api_suffix.is_some_and(|suffix| matches!(suffix, "auth/login" | "auth/setup" | "auth/check" | "auth/captcha")) {
+    let Some(suffix) = middleware_api_path_suffix(req.uri().path(), &state.public_base_path).map(str::to_string) else {
+        return next.run(req).await;
+    };
+
+    if is_cross_site(req.method(), req.headers(), &state.trusted_origins) {
+        return error_response(StatusCode::FORBIDDEN, CROSS_SITE_REQUEST);
+    }
+
+    if is_bootstrap_route(&suffix) || state.password_disabled {
         return next.run(req).await;
     }
 
-    // Non-API requests (static files) are always accessible.
-    if api_suffix.is_none() {
-        return next.run(req).await;
+    if !state.users_configured() {
+        return error_response(StatusCode::UNAUTHORIZED, SETUP_REQUIRED);
     }
 
-    if state.password_disabled {
-        return next.run(req).await;
+    let Some(token) = session_token_from_headers(req.headers()) else {
+        return error_response(StatusCode::UNAUTHORIZED, SESSION_EXPIRED);
+    };
+    let Some(user) = state.session_manager.validate(&state.app.storage, &token, now_millis()).await else {
+        forget_live_session(&state, &token).await;
+        return error_response(StatusCode::UNAUTHORIZED, SESSION_EXPIRED);
+    };
+    if user.must_change_password && !allowed_while_password_change_required(&suffix) {
+        return error_response(StatusCode::FORBIDDEN, PASSWORD_CHANGE_REQUIRED);
     }
 
-    if state.password_hash.read().await.is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if !state.sessions.read().await.contains(&token) {
+        state.sessions.write().await.insert(token.clone());
     }
-
-    // Check session token
-    let token = extract_session_token(&req);
-    if let Some(ref token) = token {
-        if state.sessions.read().await.contains(token) {
-            // 在下游处理器及其 await 到的池创建路径上注入当前登录会话的 owner 作用域，
-            // 使 save_password=false 连接的临时密码按会话隔离（见 SessionCredentialStore）。
-            let owner = token.clone();
-            return dbx_core::session_credentials::with_credential_owner(
-                Some(owner),
-                async move { next.run(req).await },
-            )
-            .await;
-        }
-    }
-
-    StatusCode::UNAUTHORIZED.into_response()
+    req.extensions_mut().insert(user);
+    let owner = token;
+    dbx_core::session_credentials::with_credential_owner(Some(owner), async move { next.run(req).await }).await
 }
+
+#[cfg(test)]
+pub(crate) mod test_sessions {
+    use dbx_authz::PlatformRole;
+    use dbx_core::storage::{NewWebUser, WebSession};
+
+    use crate::sessions::{hash_token, now_millis};
+    use crate::state::WebState;
+
+    pub(crate) const TEST_USERNAME: &str = "tester";
+
+    pub(crate) async fn ensure_user(state: &WebState, password: &str) -> String {
+        state.users_configured.store(true, std::sync::atomic::Ordering::Release);
+        let storage = &state.app.storage;
+        if let Some(user) = storage.find_web_user_by_username(TEST_USERNAME).await.unwrap() {
+            return user.id;
+        }
+        storage
+            .create_web_user(
+                NewWebUser {
+                    username: TEST_USERNAME.into(),
+                    display_name: None,
+                    password_hash: crate::identity::hash_password(password).unwrap(),
+                    role: PlatformRole::Admin,
+                    must_change_password: false,
+                },
+                now_millis(),
+            )
+            .await
+            .unwrap()
+            .id
+    }
+
+    pub(crate) async fn issue(state: &WebState, token: &str) {
+        issue_with_password(state, token, "test-password").await;
+    }
+
+    pub(crate) async fn issue_with_password(state: &WebState, token: &str, password: &str) {
+        let user_id = ensure_user(state, password).await;
+        let now = now_millis();
+        state
+            .app
+            .storage
+            .insert_web_session(WebSession {
+                token_hash: hash_token(token),
+                user_id,
+                created_at: now,
+                last_seen_at: now,
+                expires_at: None,
+                revoked_at: None,
+                ip: None,
+                user_agent: None,
+                mfa_verified: false,
+            })
+            .await
+            .unwrap();
+        state.sessions.write().await.insert(token.to_string());
+    }
+}
+
+#[cfg(test)]
+mod http_tests;
 
 #[cfg(test)]
 mod tests {

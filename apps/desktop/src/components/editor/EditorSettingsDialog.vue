@@ -31,6 +31,7 @@ import {
   Keyboard,
   Loader2,
   LogOut,
+  UserRound,
   Moon,
   PackageSearch,
   Palette,
@@ -431,6 +432,7 @@ import {
   type SyncMethod,
 } from "@/lib/webdav/webdavAutoUploadConfig";
 import { apiUrl, webPath } from "@/lib/common/webPath";
+import { checkStartupAuthentication, readAuthErrorCode, type WebUser } from "@/lib/startup/startupAuthentication";
 import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, normalizeCustomFontFamilyInput, readableFontFamily, SYSTEM_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { buildFontFamilyOptions, displayFontFamily, isPresetFontFamily, loadSystemFontNames } from "@/lib/app/fontFamilyOptions";
 import { buildAppSupportInfoRows, formatAppSupportInfoForClipboard, type AppSupportInfoLabels } from "@/lib/app/supportInfo";
@@ -6279,6 +6281,16 @@ const confirmNewPassword = ref("");
 const passwordMessage = ref("");
 const passwordError = ref(false);
 const changingPassword = ref(false);
+const signedInUser = ref<WebUser | null>(null);
+
+async function loadSignedInUser() {
+  if (!isWeb) return;
+  try {
+    signedInUser.value = (await checkStartupAuthentication()).user ?? null;
+  } catch {
+    signedInUser.value = null;
+  }
+}
 
 async function scrollToInitialSettingsSection() {
   await nextTick();
@@ -6592,11 +6604,9 @@ async function changePassword() {
       oldPassword.value = "";
       newPassword.value = "";
       confirmNewPassword.value = "";
-    } else if (res.status === 401) {
-      passwordMessage.value = t("auth.oldPasswordWrong");
-      passwordError.value = true;
     } else {
-      passwordMessage.value = t("auth.changePasswordFailed");
+      const code = await readAuthErrorCode(res);
+      passwordMessage.value = code === "old_password_invalid" ? t("auth.oldPasswordWrong") : translateBackendError(t, code) || t("auth.changePasswordFailed");
       passwordError.value = true;
     }
   } catch {
@@ -13985,7 +13995,14 @@ LIMIT 100;</pre>
               <ChangelogPanel :checking-updates="props.checkingUpdates" @check-updates="emit('check-updates')" />
             </section>
 
-            <section v-else-if="activeSettingsTab === 'security' && isWeb" data-settings-search-id="security" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('security')]">
+            <section v-else-if="activeSettingsTab === 'security' && isWeb" data-settings-search-id="security" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('security')]" @vue:mounted="loadSignedInUser">
+              <div v-if="signedInUser" class="flex items-center gap-3 rounded-md border border-border/60 px-3 py-2" data-testid="signed-in-user">
+                <UserRound class="h-4 w-4 text-muted-foreground" />
+                <div class="min-w-0 flex-1">
+                  <p class="truncate text-sm font-medium">{{ signedInUser.display_name || signedInUser.username }}</p>
+                  <p class="text-xs text-muted-foreground">{{ t("auth.signedInAs", { username: signedInUser.username }) }} · {{ signedInUser.role === "admin" ? t("auth.roleAdmin") : t("auth.roleUser") }}</p>
+                </div>
+              </div>
               <div class="space-y-3">
                 <Label class="text-base">{{ t("auth.changePassword") }}</Label>
                 <p class="text-sm text-muted-foreground">

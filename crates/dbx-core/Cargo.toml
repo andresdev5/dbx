@@ -32,6 +32,7 @@ dbx-drivers = { path = "../dbx-drivers", default-features = false }
 dbx-sql = { path = "../dbx-sql", default-features = false }
 dbx-plugin-runtime = { path = "../dbx-plugin-runtime" }
 dbx-formats = { path = "../dbx-formats" }
+dbx-authz = { path = "../dbx-authz" }
 dbx-types = { path = "../dbx-types", default-features = false }
 dbx-ai-provider = { path = "../dbx-ai-provider" }
 dbx-platform = { path = "../dbx-platform", features = ["host-prompts", "downloads"] }

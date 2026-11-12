@@ -25,6 +25,7 @@ const startupAsyncOptions = {
 };
 const App = defineAsyncComponent({ ...startupAsyncOptions, loader: () => import("./App.vue") });
 const LoginPage = defineAsyncComponent({ ...startupAsyncOptions, loader: () => import("@/components/auth/LoginPage.vue") });
+const ForcePasswordChange = defineAsyncComponent({ ...startupAsyncOptions, loader: () => import("@/components/auth/ForcePasswordChange.vue") });
 const SecurityMigrationWizard = defineAsyncComponent({ ...startupAsyncOptions, loader: () => import("@/components/migration/SecurityMigrationWizard.vue") });
 const props = defineProps<{ localeReady?: Promise<void> }>();
 const { t } = useI18n();
@@ -33,6 +34,7 @@ const { blocking } = migration;
 const checkingAuth = ref(true);
 const loginRequired = ref(false);
 const setupRequired = ref(false);
+const passwordChangeRequired = ref(false);
 const authFailed = ref(false);
 const startupAuthentication = shallowRef<StartupAuthentication>();
 const checkingLocale = ref(Boolean(props.localeReady));
@@ -72,10 +74,12 @@ async function initialize() {
       startupAuthentication.value = result;
       setupRequired.value = result.setup_required === true;
       loginRequired.value = setupRequired.value || (result.required && !result.authenticated);
+      passwordChangeRequired.value = !loginRequired.value && result.user?.must_change_password === true;
       if (loginRequired.value) {
         history.replaceState(null, "", webPath("/login"));
         return;
       }
+      if (passwordChangeRequired.value) return;
       await initializePasswordViewerCapability();
     } else {
       await initializePasswordViewerCapability();
@@ -101,6 +105,7 @@ onUnmounted(() => authRequest?.abort());
 <template>
   <StartupLoading v-if="checkingLocale || localeFailed || checkingAuth || authFailed" :label="authFailed ? t('migration.authFailed') : !checkingLocale && !localeFailed ? t('migration.checking') : undefined" :error="localeFailed || authFailed" :retry="localeFailed ? initializeLocale : initialize" />
   <LoginPage v-else-if="loginRequired" :setup-mode="setupRequired" @authenticated="authenticated" />
+  <ForcePasswordChange v-else-if="passwordChangeRequired" :username="startupAuthentication?.user?.username" @changed="initialize" @logged-out="initialize" />
   <SecurityMigrationWizard v-else-if="blocking" :store="migration" />
   <App v-else :startup-authentication="startupAuthentication" />
 </template>

@@ -193,6 +193,17 @@ const patterns: [RegExp, string][] = [
   // Web auth rate limiting and captcha gate (crates/dbx-web/src/auth.rs)
   [/^Please try again in (\d+)s$/, "auth.rateLimited"],
   [/^captcha_invalid$/, "auth.captchaInvalid"],
+  [/^invalid_credentials$/, "auth.invalidCredentials"],
+  [/^setup_token_invalid$/, "auth.setupTokenInvalid"],
+  [/^setup_not_available$/, "auth.setupNotAvailable"],
+  [/^username_invalid$/, "auth.usernameInvalid"],
+  [/^password_too_short$/, "auth.passwordTooShort"],
+  [/^password_too_long$/, "auth.passwordTooLong"],
+  [/^password_unchanged$/, "auth.passwordUnchanged"],
+  [/^old_password_invalid$/, "auth.oldPasswordWrong"],
+  [/^session_expired$/, "auth.sessionExpired"],
+  [/^password_change_required$/, "auth.passwordChangeRequired"],
+  [/^cross_site_request$/, "auth.crossSiteRequest"],
 
   // Dameng native dexp/dimp dump (crates/dbx-core/src/data/dameng_dump.rs)
   [/^\[damengToolNotFound\]/, "damengDump.errors.toolNotFound"],

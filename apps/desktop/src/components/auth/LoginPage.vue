@@ -4,7 +4,7 @@ import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import PasswordInput from "@/components/ui/PasswordInput.vue";
-import { Lock, Loader2, ShieldCheck, ShieldQuestion } from "@lucide/vue";
+import { KeyRound, Lock, Loader2, ShieldCheck, ShieldQuestion, User } from "@lucide/vue";
 import AppLogo from "@/components/icons/AppLogo.vue";
 import { apiUrl } from "@/lib/common/webPath";
 import { translateBackendError } from "@/i18n/backend-errors";
@@ -16,9 +16,11 @@ const props = withDefaults(
   { setupMode: false },
 );
 
-const emit = defineEmits<{ authenticated: [] }>();
+const emit = defineEmits<{ authenticated: [result: { mustChangePassword: boolean }] }>();
 const { t } = useI18n();
 
+const username = ref("");
+const setupToken = ref("");
 const password = ref("");
 const confirmPassword = ref("");
 const captchaCode = ref("");
@@ -56,7 +58,9 @@ async function refreshCaptcha() {
   if (props.setupMode) return;
   captchaLoading.value = true;
   try {
-    const res = await fetch(apiUrl("/api/auth/captcha"), { headers: { Accept: "application/json" } });
+    const name = username.value.trim();
+    const query = name ? `?username=${encodeURIComponent(name)}` : "";
+    const res = await fetch(apiUrl(`/api/auth/captcha${query}`), { headers: { Accept: "application/json" } });
     if (res.status === 204) {
       captchaRequired.value = false;
       captchaId.value = "";
@@ -97,14 +101,20 @@ async function submit() {
   error.value = "";
   try {
     const url = apiUrl(props.setupMode ? "/api/auth/setup" : "/api/auth/login");
-    const payload = props.setupMode ? { password: password.value } : captchaRequired.value ? { password: password.value, captcha_id: captchaId.value, captcha_code: captchaCode.value } : { password: password.value };
+    const name = username.value.trim();
+    const payload = props.setupMode
+      ? { setup_token: setupToken.value.trim(), username: name, password: password.value }
+      : captchaRequired.value
+        ? { username: name, password: password.value, captcha_id: captchaId.value, captcha_code: captchaCode.value }
+        : { username: name, password: password.value };
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     if (res.ok) {
-      emit("authenticated");
+      const body = (await res.json().catch(() => ({}))) as { must_change_password?: boolean };
+      emit("authenticated", { mustChangePassword: body.must_change_password === true });
     } else {
       error.value = await readAuthError(res);
       if (!props.setupMode) await refreshCaptcha();
@@ -140,9 +150,20 @@ onMounted(() => {
           <ShieldCheck class="w-4 h-4" />
           <span>{{ t("auth.setupTitle") }}</span>
         </div>
+        <div v-if="setupMode" class="space-y-1">
+          <div class="relative">
+            <KeyRound class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input v-model="setupToken" :placeholder="t('auth.setupToken')" class="pl-10 h-11 font-mono" autocomplete="off" spellcheck="false" data-testid="setup-token-input" />
+          </div>
+          <p class="text-xs text-muted-foreground">{{ t("auth.setupTokenHint") }}</p>
+        </div>
+        <div class="relative">
+          <User class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+          <Input v-model="username" :placeholder="setupMode ? t('auth.newUsername') : t('auth.username')" class="pl-10 h-11" autocomplete="username" spellcheck="false" autofocus data-testid="username-input" />
+        </div>
         <div class="relative">
           <Lock class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <PasswordInput v-model="password" :placeholder="setupMode ? t('auth.newPassword') : t('auth.enterPassword')" inputClass="pl-10 h-11" autocomplete="off" autofocus />
+          <PasswordInput v-model="password" :placeholder="setupMode ? t('auth.newPassword') : t('auth.enterPassword')" inputClass="pl-10 h-11" :autocomplete="setupMode ? 'new-password' : 'current-password'" />
         </div>
         <div v-if="setupMode" class="relative">
           <Lock class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
@@ -167,9 +188,9 @@ onMounted(() => {
           </button>
         </div>
         <p v-if="error" class="text-sm text-destructive text-center">{{ error }}</p>
-        <Button type="submit" class="w-full h-11 text-sm font-medium" :disabled="loading || !password || (setupMode && !confirmPassword) || (!setupMode && captchaRequired && !captchaCode)">
+        <Button type="submit" class="w-full h-11 text-sm font-medium" :disabled="loading || !username.trim() || !password || (setupMode && (!confirmPassword || !setupToken.trim())) || (!setupMode && captchaRequired && !captchaCode)">
           <Loader2 v-if="loading" class="w-4 h-4 animate-spin mr-2" />
-          {{ loading ? t("auth.processing") : setupMode ? t("auth.setPassword") : t("auth.login") }}
+          {{ loading ? t("auth.processing") : setupMode ? t("auth.createAdmin") : t("auth.login") }}
         </Button>
       </form>
 

@@ -848,7 +848,7 @@ fn is_sqlserver_plan_capture_set(sql: &str) -> bool {
     matches!(tokens.as_slice(), ["SET", "SHOWPLAN_XML", "ON" | "OFF"] | ["SET", "STATISTICS", "XML", "ON" | "OFF"])
 }
 
-fn is_mysql_compatible_database(database_type: DatabaseType) -> bool {
+pub(crate) fn is_mysql_compatible_database(database_type: DatabaseType) -> bool {
     matches!(
         database_type,
         DatabaseType::Mysql

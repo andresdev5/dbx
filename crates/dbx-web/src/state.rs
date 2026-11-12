@@ -8,9 +8,67 @@ use tokio_util::sync::CancellationToken;
 
 use crate::sse::TransferProgressChannel;
 
-pub struct LoginRateLimit {
-    pub fail_count: u32,
-    pub locked_until: Option<std::time::Instant>,
+pub const LOGIN_MAX_ATTEMPTS: u32 = 5;
+pub const LOGIN_LOCKOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const LOGIN_FORGET_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const LOGIN_MAX_TRACKED_KEYS: usize = 10_000;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct LoginAttempts {
+    failures: u32,
+    locked_until: Option<std::time::Instant>,
+    last_failure: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Default)]
+pub struct LoginThrottle {
+    entries: HashMap<String, LoginAttempts>,
+}
+
+impl LoginThrottle {
+    pub fn ip_key(ip: Option<std::net::IpAddr>) -> String {
+        format!("ip:{}", ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".into()))
+    }
+
+    pub fn user_key(username: &str) -> String {
+        format!("user:{}", username.trim().to_lowercase())
+    }
+
+    pub fn failures(&self, key: &str) -> u32 {
+        self.entries.get(key).map_or(0, |attempts| attempts.failures)
+    }
+
+    pub fn locked_for(&self, key: &str, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.entries
+            .get(key)
+            .and_then(|attempts| attempts.locked_until)
+            .filter(|until| *until > now)
+            .map(|until| until - now)
+    }
+
+    pub fn record_failure(&mut self, key: &str, now: std::time::Instant) {
+        self.prune(now);
+        let attempts = self.entries.entry(key.to_string()).or_default();
+        attempts.failures = attempts.failures.saturating_add(1);
+        attempts.last_failure = Some(now);
+        if attempts.failures.is_multiple_of(LOGIN_MAX_ATTEMPTS) {
+            attempts.locked_until = Some(now + LOGIN_LOCKOUT);
+        }
+    }
+
+    pub fn clear(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        self.entries.retain(|_, attempts| {
+            attempts.locked_until.is_some_and(|until| until > now)
+                || attempts.last_failure.is_some_and(|last| now.duration_since(last) < LOGIN_FORGET_AFTER)
+        });
+        if self.entries.len() >= LOGIN_MAX_TRACKED_KEYS {
+            self.entries.retain(|_, attempts| attempts.locked_until.is_some_and(|until| until > now));
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,7 +99,10 @@ pub struct WebState {
     pub password_viewer_enabled: bool,
     /// `DBX_DEMO_MODE`：公网演示部署的封锁开关（见 `demo` 模块）。
     pub demo_mode: bool,
-    pub password_hash: RwLock<Option<String>>,
+    pub users_configured: AtomicBool,
+    pub session_manager: crate::sessions::SessionManager,
+    pub setup_token: crate::bootstrap::SetupTokenSlot,
+    pub trusted_origins: Vec<String>,
     pub sessions: RwLock<HashSet<String>>,
     pub sse_channels: RwLock<HashMap<String, broadcast::Sender<String>>>,
     pub transfer_progress_channels: RwLock<HashMap<String, Arc<TransferProgressChannel>>>,
@@ -52,7 +113,7 @@ pub struct WebState {
     pub sql_file_failure_logs: dbx_core::sql_file_import::SqlFileFailureLogRegistry,
     pub managed_sql_previews: crate::routes::sql_file::ManagedSqlPreviews,
     pub nacos_imports: RwLock<HashMap<String, NacosImportContext>>,
-    pub login_rate_limit: Mutex<LoginRateLimit>,
+    pub login_throttle: Mutex<LoginThrottle>,
     /// Single-use image challenges gating `auth::login`.
     pub captchas: crate::captcha::CaptchaStore,
     /// When `auth::login` demands a challenge. Editable from `设置 → 安全`
@@ -69,6 +130,10 @@ pub struct WebState {
 }
 
 impl WebState {
+    pub fn users_configured(&self) -> bool {
+        self.users_configured.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub async fn remove_sse_channel(&self, id: &str) {
         self.sse_channels.write().await.remove(id);
     }
@@ -84,7 +149,10 @@ impl WebState {
             password_disabled: false,
             password_viewer_enabled: true,
             demo_mode: false,
-            password_hash: RwLock::new(None),
+            users_configured: AtomicBool::new(false),
+            session_manager: crate::sessions::SessionManager::new(crate::sessions::SessionConfig::default()),
+            setup_token: Default::default(),
+            trusted_origins: Vec::new(),
             sessions: RwLock::new(HashSet::new()),
             sse_channels: RwLock::new(HashMap::new()),
             transfer_progress_channels: RwLock::new(HashMap::new()),
@@ -93,7 +161,7 @@ impl WebState {
             sql_file_executions: RwLock::new(HashMap::new()),
             managed_sql_previews: Default::default(),
             nacos_imports: RwLock::new(HashMap::new()),
-            login_rate_limit: Mutex::new(LoginRateLimit { fail_count: 0, locked_until: None }),
+            login_throttle: Mutex::new(LoginThrottle::default()),
             captchas: crate::captcha::CaptchaStore::new(),
             captcha_mode: tokio::sync::RwLock::new(crate::captcha::CaptchaMode::Auto),
             captcha_env_locked: false,
@@ -102,5 +170,42 @@ impl WebState {
             migration_ready: Arc::new(AtomicBool::new(true)),
             web_mcp: Arc::new(crate::web_mcp::WebMcpRuntime::disabled()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LoginThrottle, LOGIN_LOCKOUT, LOGIN_MAX_ATTEMPTS};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn throttle_locks_each_key_independently_and_keeps_counting_for_captcha() {
+        let mut throttle = LoginThrottle::default();
+        let now = Instant::now();
+        let ana = LoginThrottle::user_key(" Ana ");
+        let bob = LoginThrottle::user_key("bob");
+        assert_eq!(ana, "user:ana");
+        for _ in 0..LOGIN_MAX_ATTEMPTS - 1 {
+            throttle.record_failure(&ana, now);
+        }
+        assert_eq!(throttle.locked_for(&ana, now), None);
+        throttle.record_failure(&ana, now);
+        assert_eq!(throttle.locked_for(&ana, now), Some(LOGIN_LOCKOUT));
+        assert_eq!(throttle.failures(&ana), LOGIN_MAX_ATTEMPTS);
+        assert_eq!(throttle.locked_for(&bob, now), None);
+        assert_eq!(throttle.locked_for(&ana, now + LOGIN_LOCKOUT), None);
+        throttle.clear(&ana);
+        assert_eq!(throttle.failures(&ana), 0);
+    }
+
+    #[test]
+    fn throttle_forgets_old_failures() {
+        let mut throttle = LoginThrottle::default();
+        let start = Instant::now();
+        throttle.record_failure("ip:1.2.3.4", start);
+        throttle.record_failure("ip:5.6.7.8", start + Duration::from_secs(20 * 60));
+        assert_eq!(throttle.failures("ip:1.2.3.4"), 0);
+        assert_eq!(throttle.failures("ip:5.6.7.8"), 1);
+        assert_eq!(LoginThrottle::ip_key(None), "ip:unknown");
     }
 }

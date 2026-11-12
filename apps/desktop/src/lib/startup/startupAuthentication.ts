@@ -1,9 +1,31 @@
 import { apiUrl } from "@/lib/common/webPath";
 
+export interface WebUser {
+  id: string;
+  username: string;
+  display_name: string | null;
+  role: "admin" | "user";
+  must_change_password: boolean;
+}
+
 export interface StartupAuthentication {
   required: boolean;
   authenticated: boolean;
   setup_required: boolean;
+  user?: WebUser;
+}
+
+function parseWebUser(value: unknown): WebUser | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const user = value as Record<string, unknown>;
+  if (typeof user.id !== "string" || typeof user.username !== "string") return undefined;
+  return {
+    id: user.id,
+    username: user.username,
+    display_name: typeof user.display_name === "string" ? user.display_name : null,
+    role: user.role === "admin" ? "admin" : "user",
+    must_change_password: user.must_change_password === true,
+  };
 }
 
 export async function checkStartupAuthentication(signal?: AbortSignal): Promise<StartupAuthentication> {
@@ -17,6 +39,7 @@ export async function checkStartupAuthentication(signal?: AbortSignal): Promise<
     required: result.required,
     authenticated: result.authenticated,
     setup_required: "setup_required" in result && result.setup_required === true,
+    user: "user" in result ? parseWebUser(result.user) : undefined,
   };
 }
 
@@ -28,4 +51,16 @@ export async function logoutWeb(): Promise<void> {
   if (!response.ok) {
     throw new Error("AUTH_LOGOUT_FAILED");
   }
+}
+
+export async function readAuthErrorCode(response: Response): Promise<string> {
+  const text = (await response.text()).trim();
+  if (!text) return "";
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed.error === "string") return parsed.error;
+  } catch {
+    return text;
+  }
+  return text;
 }

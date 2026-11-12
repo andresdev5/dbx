@@ -4,6 +4,8 @@ pub use dbx_drivers::runtime_config::{
 };
 
 mod type_execution_receipts;
+mod web_users;
+pub use web_users::{NewWebUser, WebSession, WebUser, USERNAME_TAKEN, USER_NOT_FOUND};
 pub use type_execution_receipts::{TypeExecutionBinding, TypeRecoveryContext};
 
 use std::collections::{HashMap, HashSet};
@@ -2689,7 +2691,7 @@ impl Storage {
     async fn init_schema(&self, migrate_legacy: bool) -> Result<(), String> {
         let migration_codec = migrate_legacy.then(|| self.secret_codec(true)).transpose()?;
         self.db.with_connection(move |conn| {
-            for statement in SCHEMA_STATEMENTS {
+            for statement in SCHEMA_STATEMENTS.iter().chain(web_users::WEB_USER_SCHEMA_STATEMENTS) {
                 conn.execute(statement, []).map_err(|e| e.to_string())?;
             }
             ensure_history_columns_sync(conn)?;

@@ -16,6 +16,7 @@ pub mod sql_analysis;
 pub mod sql_diagnostics;
 pub mod sql_editability;
 pub mod sql_error_position;
+pub mod sql_operations;
 pub mod sql_risk;
 pub mod sqlserver_temporal;
 pub mod tdsql_mysql;

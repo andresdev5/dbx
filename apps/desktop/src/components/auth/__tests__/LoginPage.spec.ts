@@ -16,10 +16,10 @@ function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
 
-function mount(): { root: HTMLElement; app: App } {
+function mount(props: Record<string, unknown> = {}): { root: HTMLElement; app: App } {
   const root = document.createElement("div");
   document.body.append(root);
-  const app = createApp(LoginPage);
+  const app = createApp(LoginPage, props);
   app.mount(root);
   return { root, app };
 }
@@ -27,7 +27,7 @@ function mount(): { root: HTMLElement; app: App } {
 // fetch + Response.json both resolve on later microtasks than nextTick, so
 // drain a few turns before asserting on the rendered result.
 async function flush() {
-  for (let i = 0; i < 6; i += 1) {
+  for (let i = 0; i < 12; i += 1) {
     await Promise.resolve();
     await nextTick();
   }
@@ -44,7 +44,7 @@ describe("LoginPage captcha", () => {
   beforeEach(() => {
     fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("/api/auth/captcha")) return jsonResponse(CAPTCHA_BODY);
+      if (url.includes("/api/auth/captcha")) return jsonResponse(CAPTCHA_BODY);
       return jsonResponse({ ok: true });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -70,6 +70,7 @@ describe("LoginPage captcha", () => {
     await flush();
 
     typeInto(root.querySelector<HTMLInputElement>('[data-testid="captcha-input"]')!, "abcde");
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="username-input"]')!, " ana ");
     const passwordInput = root.querySelector<HTMLInputElement>('input[type="password"]')!;
     typeInto(passwordInput, "secret");
     await nextTick();
@@ -80,26 +81,27 @@ describe("LoginPage captcha", () => {
     const loginCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/api/auth/login"));
     expect(loginCall).toBeTruthy();
     const body = JSON.parse(String((loginCall![1] as RequestInit).body));
-    expect(body).toEqual({ password: "secret", captcha_id: "challenge-1", captcha_code: "abcde" });
+    expect(body).toEqual({ username: "ana", password: "secret", captcha_id: "challenge-1", captcha_code: "abcde" });
     app.unmount();
   });
 
   it("refreshes the challenge after a rejected attempt", async () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("/api/auth/captcha")) return jsonResponse({ ...CAPTCHA_BODY, id: `challenge-${fetchMock.mock.calls.length}` });
+      if (url.includes("/api/auth/captcha")) return jsonResponse({ ...CAPTCHA_BODY, id: `challenge-${fetchMock.mock.calls.length}` });
       return jsonResponse({ error: "captcha_invalid" }, 400);
     });
     const { root, app } = mount();
     await flush();
 
     typeInto(root.querySelector<HTMLInputElement>('[data-testid="captcha-input"]')!, "zzzzz");
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="username-input"]')!, "admin");
     typeInto(root.querySelector<HTMLInputElement>('input[type="password"]')!, "secret");
     await nextTick();
     root.querySelector("form")!.dispatchEvent(new Event("submit"));
     await flush();
 
-    const captchaCalls = fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/api/auth/captcha"));
+    const captchaCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes("/api/auth/captcha"));
     expect(captchaCalls.length).toBeGreaterThanOrEqual(2);
     // The consumed challenge is replaced and the input cleared.
     expect(root.querySelector<HTMLInputElement>('[data-testid="captcha-input"]')!.value).toBe("");
@@ -109,13 +111,14 @@ describe("LoginPage captcha", () => {
   it("hides the challenge when the server answers 204 and logs in without one", async () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("/api/auth/captcha")) return new Response(null, { status: 204 });
+      if (url.includes("/api/auth/captcha")) return new Response(null, { status: 204 });
       return jsonResponse({ ok: true });
     });
     const { root, app } = mount();
     await flush();
 
     expect(root.querySelector('[data-testid="captcha-input"]')).toBeNull();
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="username-input"]')!, "admin");
     typeInto(root.querySelector<HTMLInputElement>('input[type="password"]')!, "secret");
     await nextTick();
     // Without a challenge on screen the submit button must not wait for one.
@@ -125,7 +128,7 @@ describe("LoginPage captcha", () => {
 
     const loginCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/api/auth/login"));
     expect(loginCall, JSON.stringify(fetchMock.mock.calls.map(([url]) => String(url)))).toBeTruthy();
-    expect(JSON.parse(String((loginCall![1] as RequestInit).body))).toEqual({ password: "secret" });
+    expect(JSON.parse(String((loginCall![1] as RequestInit).body))).toEqual({ username: "admin", password: "secret" });
     app.unmount();
   });
 
@@ -133,17 +136,18 @@ describe("LoginPage captcha", () => {
     let attempts = 0;
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("/api/auth/captcha")) {
+      if (url.includes("/api/auth/captcha")) {
         // auto: no challenge until the first failure
         return attempts === 0 ? new Response(null, { status: 204 }) : jsonResponse(CAPTCHA_BODY);
       }
       attempts += 1;
-      return jsonResponse({ error: "invalid_password" }, 401);
+      return jsonResponse({ error: "invalid_credentials" }, 401);
     });
     const { root, app } = mount();
     await flush();
     expect(root.querySelector('[data-testid="captcha-input"]')).toBeNull();
 
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="username-input"]')!, "ana");
     typeInto(root.querySelector<HTMLInputElement>('input[type="password"]')!, "wrong");
     await nextTick();
     root.querySelector("form")!.dispatchEvent(new Event("submit"));
@@ -151,6 +155,54 @@ describe("LoginPage captcha", () => {
 
     expect(root.querySelector('[data-testid="captcha-input"]')).not.toBeNull();
     expect(root.querySelector('[data-testid="captcha-image"]')?.getAttribute("src")).toBe(CAPTCHA_BODY.image);
+    const refreshed = fetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes("/api/auth/captcha"));
+    expect(refreshed.at(-1)).toContain("?username=ana");
+    app.unmount();
+  });
+
+  it("keeps the submit button disabled until a username is typed", async () => {
+    fetchMock.mockImplementation(async () => new Response(null, { status: 204 }));
+    const { root, app } = mount();
+    await flush();
+    typeInto(root.querySelector<HTMLInputElement>('input[type="password"]')!, "secret");
+    await nextTick();
+    expect(root.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true);
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="username-input"]')!, "admin");
+    await nextTick();
+    expect(root.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(false);
+    app.unmount();
+  });
+
+  it("reports when the server requires a password change after login", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/api/auth/captcha")) return new Response(null, { status: 204 });
+      return jsonResponse({ ok: true, must_change_password: true });
+    });
+    const authenticated = vi.fn();
+    const { root, app } = mount({ onAuthenticated: authenticated });
+    await flush();
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="username-input"]')!, "ana");
+    typeInto(root.querySelector<HTMLInputElement>('input[type="password"]')!, "secret");
+    await nextTick();
+    root.querySelector("form")!.dispatchEvent(new Event("submit"));
+    await flush();
+    expect(authenticated).toHaveBeenCalledWith({ mustChangePassword: true });
+    app.unmount();
+  });
+
+  it("sends the setup token and the administrator name while setting up", async () => {
+    const { root, app } = mount({ setupMode: true });
+    await flush();
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="setup-token-input"]')!, " token-123 ");
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="username-input"]')!, "boss");
+    const [password, confirm] = Array.from(root.querySelectorAll<HTMLInputElement>('input[type="password"]'));
+    typeInto(password, "boss-password");
+    typeInto(confirm, "boss-password");
+    await nextTick();
+    root.querySelector("form")!.dispatchEvent(new Event("submit"));
+    await flush();
+    const setupCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/api/auth/setup"));
+    expect(JSON.parse(String((setupCall![1] as RequestInit).body))).toEqual({ setup_token: "token-123", username: "boss", password: "boss-password" });
     app.unmount();
   });
 

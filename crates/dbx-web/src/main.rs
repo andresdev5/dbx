@@ -1,9 +1,13 @@
 mod auth;
+mod bootstrap;
 mod captcha;
 mod credentials;
 mod demo;
 mod error;
+mod identity;
+mod request_context;
 mod routes;
+mod sessions;
 mod sse;
 mod ssh_prompt;
 mod state;
@@ -14,9 +18,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHasher};
 use axum::extract::DefaultBodyLimit;
 
 /// Login/setup payloads are one password field; 64 KiB is generous.
@@ -195,6 +196,25 @@ async fn web_mcp_demo_gate(
         return StatusCode::FORBIDDEN.into_response();
     }
     next.run(request).await
+}
+
+fn start_session_purge(state: &Arc<WebState>) {
+    let state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+        loop {
+            interval.tick().await;
+            let Some(state) = state.upgrade() else { break };
+            if state.password_disabled {
+                break;
+            }
+            match state.session_manager.purge(&state.app.storage, sessions::now_millis()).await {
+                Ok(0) => {}
+                Ok(purged) => log::debug!("Purged {purged} expired DBX Web sessions"),
+                Err(error) => log::warn!("Failed to purge expired DBX Web sessions: {error}"),
+            }
+        }
+    });
 }
 
 async fn storage_migration_ready(app: &Arc<AppState>) -> bool {
@@ -572,20 +592,29 @@ async fn serve() -> Result<(), String> {
 
     app_state.set_honor_fixed_ssh_local_ports(true);
 
-    // Password hash: env var takes priority, then database
     let password_disabled = std::env::var("DBX_DISABLE_PASSWORD")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
     let password_viewer_enabled =
         password_viewer_enabled_from_env(std::env::var("DBX_DISABLE_PASSWORD_VIEWER").ok().as_deref());
 
-    let password_hash = if password_disabled {
-        None
-    } else if let Ok(pw) = std::env::var("DBX_PASSWORD") {
-        let salt = SaltString::generate(&mut OsRng);
-        Some(Argon2::default().hash_password(pw.as_bytes(), &salt).expect("Failed to hash password").to_string())
+    let users_configured = if password_disabled {
+        log::warn!("DBX_DISABLE_PASSWORD is set: DBX Web accepts every request without login");
+        false
     } else {
-        app_state.storage.load_password_hash().await.unwrap_or(None)
+        match bootstrap::bootstrap_users(
+            &app_state.storage,
+            &bootstrap::BootstrapEnv::from_env(),
+            sessions::now_millis(),
+        )
+        .await
+        {
+            Ok(outcome) => outcome.users_configured(),
+            Err(error) => {
+                log::error!("DBX Web user bootstrap failed: {error}");
+                app_state.storage.count_web_users().await.map(|count| count > 0).unwrap_or(false)
+            }
+        }
     };
 
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
@@ -606,7 +635,7 @@ async fn serve() -> Result<(), String> {
 
     let migration_ready = storage_migration_ready(&app_state).await;
     let web_mcp = Arc::new(if migration_ready {
-        WebMcpRuntime::load(&app_state.storage, !password_disabled && password_hash.is_some())
+        WebMcpRuntime::load(&app_state.storage, !password_disabled && users_configured)
             .await
             .map_err(web_mcp_startup_error)?
     } else {
@@ -620,7 +649,10 @@ async fn serve() -> Result<(), String> {
         demo_mode,
         password_disabled,
         password_viewer_enabled,
-        password_hash: RwLock::new(password_hash),
+        users_configured: AtomicBool::new(users_configured),
+        session_manager: sessions::SessionManager::new(sessions::SessionConfig::from_env()),
+        setup_token: Default::default(),
+        trusted_origins: request_context::trusted_origins_from_env(),
         sessions: RwLock::new(HashSet::new()),
         sse_channels: RwLock::new(HashMap::new()),
         transfer_progress_channels: RwLock::new(HashMap::new()),
@@ -629,7 +661,7 @@ async fn serve() -> Result<(), String> {
         sql_file_failure_logs: Default::default(),
         managed_sql_previews: Default::default(),
         nacos_imports: RwLock::new(HashMap::new()),
-        login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
+        login_throttle: tokio::sync::Mutex::new(state::LoginThrottle::default()),
         captchas: captcha::CaptchaStore::new(),
         captcha_mode: tokio::sync::RwLock::new(captcha_mode),
         captcha_env_locked,
@@ -639,6 +671,10 @@ async fn serve() -> Result<(), String> {
         web_mcp,
     });
 
+    if !password_disabled && !users_configured {
+        web_state.setup_token.ensure_issued();
+    }
+    start_session_purge(&web_state);
     ssh_prompt::install_web_ssh_prompt_bridge(web_state.ssh_prompts.clone());
     routes::sql_file::start_sql_file_cleanup(&web_state);
     routes::connection::start_connection_idle_sweeper(&web_state);
@@ -1718,9 +1754,10 @@ async fn serve() -> Result<(), String> {
     });
 
     let shutdown_wait = server_shutdown.clone();
-    let serve_future = axum::serve(listener, app).with_graceful_shutdown(async move {
-        shutdown_wait.cancelled().await;
-    });
+    let serve_future = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async move {
+            shutdown_wait.cancelled().await;
+        });
 
     // If graceful shutdown of HTTP connections takes longer than 5 seconds, abort to ensure prompt termination on Ctrl+C.
     // Non-zero exit codes keep systemd's Restart=on-failure meaningful: a serve error or an

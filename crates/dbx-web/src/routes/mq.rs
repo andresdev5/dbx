@@ -1574,7 +1574,7 @@ pub async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::{create_exchange, delete_user, list_tenants, send_message, ConnReq, CreateExchangeReq, SendMessageReq};
-    use crate::state::{LoginRateLimit, WebState};
+    use crate::state::{LoginThrottle, WebState};
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue};
     use axum::Json;
@@ -1612,7 +1612,10 @@ mod tests {
             password_disabled: false,
             password_viewer_enabled: true,
             demo_mode: false,
-            password_hash: RwLock::new(None),
+            users_configured: std::sync::atomic::AtomicBool::new(false),
+            session_manager: crate::sessions::SessionManager::new(crate::sessions::SessionConfig::default()),
+            setup_token: Default::default(),
+            trusted_origins: Vec::new(),
             sessions: RwLock::new(HashSet::new()),
             sse_channels: RwLock::new(HashMap::new()),
             transfer_progress_channels: RwLock::new(HashMap::new()),
@@ -1621,7 +1624,7 @@ mod tests {
             sql_file_failure_logs: Default::default(),
             managed_sql_previews: Default::default(),
             nacos_imports: RwLock::new(HashMap::new()),
-            login_rate_limit: Mutex::new(LoginRateLimit { fail_count: 0, locked_until: None }),
+            login_throttle: Mutex::new(LoginThrottle::default()),
             captchas: crate::captcha::CaptchaStore::new(),
             captcha_mode: tokio::sync::RwLock::new(crate::captcha::CaptchaMode::Auto),
             captcha_env_locked: false,

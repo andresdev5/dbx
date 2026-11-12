@@ -266,7 +266,7 @@ mod tests {
         let mut state = WebState::for_tests(app, directory.path().to_path_buf());
         state.password_disabled = disabled;
         if !disabled {
-            *state.password_hash.get_mut() = Some("configured".into());
+            *state.users_configured.get_mut() = true;
         }
         let state = Arc::new(state);
         let routes = router()
@@ -335,7 +335,7 @@ mod tests {
         let denied = routes.post("/pl-debug/bootstrap", None, serde_json::json!({})).await;
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
         assert!(state.sessions.read().await.is_empty());
-        state.sessions.write().await.insert("validated-login".into());
+        crate::auth::test_sessions::issue(&state, "validated-login").await;
         let allowed =
             routes.post("/pl-debug/bootstrap", Some("dbx_session=validated-login"), serde_json::json!({})).await;
         assert_eq!(allowed.status(), StatusCode::OK);
@@ -424,7 +424,7 @@ for line in sys.stdin:
     }
 
     async fn start_session_at(state: &WebState, routes: &TestServer, owner: &str, connection_id: &str) -> Value {
-        state.sessions.write().await.insert(owner.into());
+        crate::auth::test_sessions::issue(state, owner).await;
         let cookie = format!("dbx_session={owner}");
         let bootstrap: Value =
             routes.post("/pl-debug/bootstrap", Some(&cookie), serde_json::json!({})).await.json().await.unwrap();
@@ -467,7 +467,8 @@ for line in sys.stdin:
     async fn admission_http_distinguishes_new_rejections_from_owner_and_epoch_failures() {
         let (_directory, state, routes) = fixture(false).await;
         configure_agent(&state, &routes).await;
-        state.sessions.write().await.extend(["first".into(), "second".into()]);
+        crate::auth::test_sessions::issue(&state, "first").await;
+        crate::auth::test_sessions::issue(&state, "second").await;
         let cookie = Some("dbx_session=first");
         let bootstrap: Value = routes.post("/pl-debug/bootstrap", cookie, json!({})).await.json().await.unwrap();
         let rejected_start: Value = routes
@@ -539,7 +540,7 @@ for line in sys.stdin:
                 state.app.configs.write().await.get_mut("conn").unwrap().transport_layers =
                     vec![serde_json::from_value(reference).unwrap()];
                 start_session(&state, &routes, "first").await;
-                state.sessions.write().await.insert("second".into());
+                crate::auth::test_sessions::issue(&state, "second").await;
                 if remove_config {
                     state.app.configs.write().await.remove("conn");
                 } else {
@@ -584,7 +585,7 @@ for line in sys.stdin:
                 state.app.configs.write().await.get_mut("conn").unwrap().transport_layers =
                     vec![serde_json::from_value(layer).unwrap()];
                 start_session(&state, &routes, "first").await;
-                state.sessions.write().await.insert("second".into());
+                crate::auth::test_sessions::issue(&state, "second").await;
                 if orphan {
                     state.app.storage.save_tunnel_profiles(&[]).await.unwrap();
                 }
@@ -747,7 +748,7 @@ for line in sys.stdin:
         state.app.configs.write().await.get_mut("conn").unwrap().transport_layers =
             vec![serde_json::from_value(reference).unwrap()];
         start_session(&state, &routes, "first").await;
-        state.sessions.write().await.insert("second".into());
+        crate::auth::test_sessions::issue(&state, "second").await;
         let mut renamed = serde_json::to_value(&profile).unwrap();
         renamed["name"] = serde_json::json!("Renamed");
         renamed["enabled"] = serde_json::json!(false);
@@ -783,7 +784,7 @@ for line in sys.stdin:
             let (_directory, state, routes) = fixture(disabled).await;
             configure_agent(&state, &routes).await;
             start_session(&state, &routes, "first").await;
-            state.sessions.write().await.insert("second".into());
+            crate::auth::test_sessions::issue(&state, "second").await;
             let original = state.app.configs.read().await.get("conn").unwrap().clone();
             let mut replacement = serde_json::to_value(&original).unwrap();
             replacement["host"] = serde_json::json!("127.0.0.2");
@@ -827,8 +828,8 @@ for line in sys.stdin:
         {
             let (_directory, state, routes) = fixture(disabled).await;
             configure_agent(&state, &routes).await;
-            state.sessions.write().await.insert("first".into());
-            state.sessions.write().await.insert("second".into());
+            crate::auth::test_sessions::issue(&state, "first").await;
+            crate::auth::test_sessions::issue(&state, "second").await;
             let mut config = serde_json::to_value(state.app.configs.read().await.get("conn").unwrap()).unwrap();
             config["transport_layers"] = serde_json::json!([{
                 "type":"proxy","id":"proxy","name":"Proxy","enabled":true,"proxy_type":"socks5",
@@ -905,7 +906,7 @@ for line in sys.stdin:
                     .await
                     .unwrap();
                 start_session(&state, &routes, "first").await;
-                state.sessions.write().await.insert("second".into());
+                crate::auth::test_sessions::issue(&state, "second").await;
                 let before = serde_json::to_value(state.app.storage.load_connections().await.unwrap()).unwrap();
                 let body = if path == "/connection/mcp/add" {
                     let mut replacement = original.clone();
@@ -961,7 +962,7 @@ for line in sys.stdin:
                     .await
                     .unwrap();
                 start_session(&state, &routes, "first").await;
-                state.sessions.write().await.insert("second".into());
+                crate::auth::test_sessions::issue(&state, "second").await;
                 let target = if scenario == "unrelated" { "unrelated" } else { "conn" };
                 let body = if path == "/connection/mcp/add" {
                     let mut replacement = original.clone();
@@ -1009,7 +1010,7 @@ for line in sys.stdin:
                 let (_directory, state, routes) = fixture(disabled).await;
                 configure_agent(&state, &routes).await;
                 state.app.configs.write().await.get_mut("conn").unwrap().read_only = true;
-                state.sessions.write().await.insert("first".into());
+                crate::auth::test_sessions::issue(&state, "first").await;
                 let first_cookie = Some("dbx_session=first");
                 let unlocked = routes
                     .post(
@@ -1020,7 +1021,7 @@ for line in sys.stdin:
                     .await;
                 assert_eq!(unlocked.status(), StatusCode::OK);
                 start_session(&state, &routes, "first").await;
-                state.sessions.write().await.insert("second".into());
+                crate::auth::test_sessions::issue(&state, "second").await;
                 let response =
                     routes.post(path, cookie, serde_json::json!({"connectionId":"conn","durationSecs":300})).await;
                 let remaining: Value = routes
@@ -1083,7 +1084,7 @@ for line in sys.stdin:
     async fn configuration_save_keeps_password_disabled_browser_credentials_in_the_original_empty_scope() {
         let (_directory, state, routes) = fixture(true).await;
         configure_agent(&state, &routes).await;
-        state.sessions.write().await.insert("first".into());
+        crate::auth::test_sessions::issue(&state, "first").await;
         let mut config = state.app.configs.read().await.get("conn").unwrap().clone();
         config.password = "first-secret".into();
         let saved = routes
@@ -1167,7 +1168,7 @@ for line in sys.stdin:
         persisted.host = "127.0.0.2".into();
         state.app.storage.save_connections(&[persisted]).await.unwrap();
         start_session(&state, &routes, "first").await;
-        state.sessions.write().await.insert("second".into());
+        crate::auth::test_sessions::issue(&state, "second").await;
         let driver = state.app.agent_manager.driver_dir("oracle");
         std::fs::write(driver.join("delay-close"), "ready").unwrap();
         let address = routes.address;
@@ -1211,7 +1212,7 @@ for line in sys.stdin:
         state.app.configs.write().await.insert("conn".into(), original.clone());
         state.app.storage.save_connections(std::slice::from_ref(&original)).await.unwrap();
         let reference = start_session(&state, &routes, "first").await;
-        state.sessions.write().await.insert("second".into());
+        crate::auth::test_sessions::issue(&state, "second").await;
         let saved = routes
             .post(
                 "/connection/save",
@@ -1250,7 +1251,7 @@ for line in sys.stdin:
                 let stored = if path == "/connection/list" { changed.clone() } else { original.clone() };
                 state.app.storage.save_connections(&[stored]).await.unwrap();
                 start_session(&state, &routes, "first").await;
-                state.sessions.write().await.insert("second".into());
+                crate::auth::test_sessions::issue(&state, "second").await;
                 let before = serde_json::to_value(state.app.storage.load_connections().await.unwrap()).unwrap();
                 let response = if path == "/connection/list" {
                     let mut request = reqwest::Client::new().get(format!("http://{}{path}", routes.address));
@@ -1302,7 +1303,7 @@ for line in sys.stdin:
             let (_directory, state, routes) = fixture(disabled).await;
             configure_agent(&state, &routes).await;
             let reference = start_session(&state, &routes, "first").await;
-            state.sessions.write().await.insert("second".into());
+            crate::auth::test_sessions::issue(&state, "second").await;
             let response =
                 routes.post("/connection/disconnect", cookie, serde_json::json!({"connectionId":"conn"})).await;
             let status: Value = routes
@@ -1356,7 +1357,7 @@ for line in sys.stdin:
             let (_directory, state, routes) = fixture(true).await;
             configure_agent(&state, &routes).await;
             start_session(&state, &routes, "first").await;
-            state.sessions.write().await.insert("second".into());
+            crate::auth::test_sessions::issue(&state, "second").await;
             let before = state.app.agent_manager.connection_runtimes.lock().await.len();
             assert_eq!(before, 1);
             let response = routes.post(path, Some("dbx_session=second"), body.clone()).await;
@@ -1485,19 +1486,16 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn password_rotation_cleans_revoked_debuggers_but_keeps_the_current_owner() {
-        use argon2::password_hash::{rand_core::OsRng, SaltString};
-        use argon2::{Argon2, PasswordHasher};
         let (_directory, state, routes) = fixture(false).await;
         configure_agent(&state, &routes).await;
-        *state.password_hash.write().await =
-            Some(Argon2::default().hash_password(b"old", &SaltString::generate(&mut OsRng)).unwrap().to_string());
+        crate::auth::test_sessions::issue_with_password(&state, "first", "old-password").await;
         let reference = start_session(&state, &routes, "first").await;
         start_session(&state, &routes, "second").await;
         let changed = routes
             .post(
                 "/auth/change-password",
                 Some("dbx_session=first"),
-                serde_json::json!({"old_password":"old","new_password":"new"}),
+                serde_json::json!({"old_password":"old-password","new_password":"new-password"}),
             )
             .await;
         assert_eq!(changed.status(), StatusCode::OK);
@@ -1547,7 +1545,8 @@ for line in sys.stdin:
         for disabled in [true, false] {
             let (_directory, state, routes) = fixture(disabled).await;
             configure_agent(&state, &routes).await;
-            state.sessions.write().await.extend(["first".into(), "second".into()]);
+            crate::auth::test_sessions::issue(&state, "first").await;
+            crate::auth::test_sessions::issue(&state, "second").await;
             let body = compilation_body(&routes, "first").await;
             let accepted = routes.post("/pl-debug/compile", Some("dbx_session=first"), body.clone()).await;
             assert_eq!(accepted.status(), StatusCode::OK);
@@ -1601,7 +1600,7 @@ for line in sys.stdin:
         for disabled in [true, false] {
             let (_directory, state, routes) = fixture(disabled).await;
             configure_agent(&state, &routes).await;
-            state.sessions.write().await.insert("first".into());
+            crate::auth::test_sessions::issue(&state, "first").await;
             let body = compilation_body(&routes, "first").await;
             let mut headers = HeaderMap::new();
             headers.insert("cookie", "dbx_session=first".parse().unwrap());
@@ -1625,7 +1624,7 @@ for line in sys.stdin:
     async fn compilation_http_readonly_rejection_is_authoritative_not_started() {
         let (_directory, state, routes) = fixture(true).await;
         configure_agent(&state, &routes).await;
-        state.sessions.write().await.insert("first".into());
+        crate::auth::test_sessions::issue(&state, "first").await;
         let body = compilation_body(&routes, "first").await;
         state.app.configs.write().await.get_mut("conn").unwrap().read_only = true;
         let response = routes.post("/pl-debug/compile", Some("dbx_session=first"), body).await;
@@ -1641,7 +1640,7 @@ for line in sys.stdin:
         for disabled in [true, false] {
             let (_directory, state, routes) = fixture(disabled).await;
             configure_agent(&state, &routes).await;
-            state.sessions.write().await.insert("first".into());
+            crate::auth::test_sessions::issue(&state, "first").await;
             let bootstrap: Value =
                 routes.post("/pl-debug/bootstrap", Some("dbx_session=first"), json!({})).await.json().await.unwrap();
             let response =
@@ -1683,7 +1682,7 @@ for line in sys.stdin:
             let (_directory, state, routes) = fixture(disabled).await;
             configure_agent(&state, &routes).await;
             let second = start_session(&state, &routes, "second").await;
-            state.sessions.write().await.insert("first".into());
+            crate::auth::test_sessions::issue(&state, "first").await;
             let driver = state.app.agent_manager.driver_dir("oracle");
             std::fs::write(driver.join("delay-inspect"), b"1").unwrap();
             let address = routes.address;

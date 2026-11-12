@@ -261,8 +261,7 @@ pub async fn load_web_capabilities(State(state): State<Arc<WebState>>) -> Json<W
 pub async fn load_web_mcp_http_status(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let endpoint_path =
         if state.public_base_path == "/" { "/mcp".to_string() } else { format!("{}/mcp", state.public_base_path) };
-    let management_available =
-        !state.password_disabled && state.password_hash.read().await.is_some() && !state.demo_mode;
+    let management_available = !state.password_disabled && state.users_configured() && !state.demo_mode;
     let mut status = state.web_mcp.status(endpoint_path, management_available);
     if state.demo_mode {
         status.enabled = false;
@@ -298,7 +297,7 @@ fn web_mcp_status_response(status: WebMcpHttpStatus) -> impl IntoResponse {
 }
 
 async fn ensure_web_mcp_management_allowed(state: &WebState, headers: &HeaderMap) -> Result<(), AppError> {
-    if state.demo_mode || state.password_disabled || state.password_hash.read().await.is_none() {
+    if state.demo_mode || state.password_disabled || !state.users_configured() {
         return Err(AppError::forbidden("Web MCP management requires password-protected DBX Web"));
     }
     if headers.get("x-dbx-mcp-settings").and_then(|value| value.to_str().ok()) != Some("1") {

@@ -5072,7 +5072,11 @@ async function handleKeydown(e: KeyboardEvent) {
   }
 }
 
-function onLoginSuccess() {
+function onLoginSuccess(result?: { mustChangePassword: boolean }) {
+  if (result?.mustChangePassword) {
+    window.location.replace(webPath("/"));
+    return;
+  }
   authenticated.value = true;
   setupRequired.value = false;
   needsAuth.value = true;

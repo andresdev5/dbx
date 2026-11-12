@@ -40,7 +40,7 @@ impl std::fmt::Display for SqlRisk {
 
 /// Normalize database dialect string to a canonical form for sqlparser.
 /// Mirrors the logic in `sql_analysis::normalize_dialect`.
-fn normalize_dialect(dialect: &str) -> &'static str {
+pub(crate) fn normalize_dialect(dialect: &str) -> &'static str {
     match dialect.to_ascii_lowercase().as_str() {
         "postgres" | "postgresql" | "redshift" | "opengauss" | "gaussdb" | "kingbase" | "highgo" | "uxdb"
         | "vastbase" | "kwdb" => "postgres",
@@ -54,7 +54,7 @@ fn normalize_dialect(dialect: &str) -> &'static str {
 }
 
 /// Resolve dialect string to a sqlparser Dialect trait object.
-fn resolve_dialect(dialect: &str) -> Box<dyn sqlparser::dialect::Dialect> {
+pub(crate) fn resolve_dialect(dialect: &str) -> Box<dyn sqlparser::dialect::Dialect> {
     match dialect {
         "postgres" => Box::new(PostgreSqlDialect {}),
         "mysql" => Box::new(MySqlDialect {}),
@@ -823,7 +823,7 @@ fn sql_has_use_statement(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -
     false
 }
 
-fn supports_select_into_table_creation(database_type: DatabaseType) -> bool {
+pub(crate) fn supports_select_into_table_creation(database_type: DatabaseType) -> bool {
     matches!(
         database_type,
         DatabaseType::Postgres
@@ -888,7 +888,7 @@ fn classify_sql_risk_with_database(
     }
 }
 
-fn sql_contains_locking_clause(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool {
+pub(crate) fn sql_contains_locking_clause(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool {
     let Ok(tokens) = Tokenizer::new(dialect, sql).tokenize() else {
         return false;
     };
