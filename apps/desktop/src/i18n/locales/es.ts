@@ -898,6 +898,8 @@ export default withEnglishFallback({
     selfModificationNotAllowed: "No puedes hacer esto con tu propia cuenta",
     userNotFound: "El usuario ya no existe",
     displayNameInvalid: "El nombre visible no es válido",
+    permissionDenied: "No tienes permiso de {operations} sobre {target}",
+    connectionAccessDenied: "No tienes acceso a la conexión {name}",
     username: "Usuario",
     newUsername: "Usuario administrador",
     setupToken: "Token de configuración",

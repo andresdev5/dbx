@@ -1205,10 +1205,23 @@ pub async fn load_connections(
             })
             .await?;
         if let ConnectionConfigSyncAttempt::Applied((_, configs)) = attempt {
+            let configs = visible_connections(&state, configs).await;
             return Ok(Json(configs.into_iter().map(|config| state.connection_response(config)).collect()));
         }
     }
     Err(AppError::conflict("Connection configuration changed while loading; reload before trying again"))
+}
+
+async fn visible_connections(state: &WebState, configs: Vec<ConnectionConfig>) -> Vec<ConnectionConfig> {
+    use dbx_core::authz::CurrentPrincipal;
+    match state.app.authz.current() {
+        CurrentPrincipal::Unenforced | CurrentPrincipal::Background => configs,
+        CurrentPrincipal::Unknown => Vec::new(),
+        CurrentPrincipal::Known(principal) => configs
+            .into_iter()
+            .filter(|config| state.app.authz.permissions(&principal, config, false).is_visible())
+            .collect(),
+    }
 }
 
 struct ConnectionConfigSync {

@@ -1,0 +1,465 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::sql_operations::{classify_sql_operations, ResolveContext};
+use dbx_authz::{compile, ConnectionContext, Decision, EffectivePermissions, Need, Operations, Principal, Resource};
+
+use crate::connection::session_credentials::current_credential_owner;
+use crate::connection::AppState;
+use crate::models::connection::{ConnectionConfig, DatabaseType};
+use crate::persistence::storage::{AuthzSnapshot, Storage};
+
+pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied:";
+
+#[derive(Default)]
+pub struct AuthzRuntime {
+    enforced: AtomicBool,
+    version: AtomicU64,
+    owners: std::sync::RwLock<HashMap<String, Principal>>,
+    snapshot: std::sync::RwLock<Arc<AuthzSnapshot>>,
+    pool_databases: std::sync::RwLock<HashMap<String, Option<String>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentPrincipal {
+    Unenforced,
+    Background,
+    Known(Principal),
+    Unknown,
+}
+
+fn read<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+pub fn default_schema(database_type: DatabaseType) -> Option<&'static str> {
+    if database_type == DatabaseType::SqlServer {
+        Some("dbo")
+    } else if is_postgres_family(database_type) {
+        Some("public")
+    } else {
+        None
+    }
+}
+
+fn is_postgres_family(database_type: DatabaseType) -> bool {
+    matches!(
+        database_type,
+        DatabaseType::Postgres
+            | DatabaseType::Redshift
+            | DatabaseType::Gaussdb
+            | DatabaseType::OpenGauss
+            | DatabaseType::Kingbase
+            | DatabaseType::Highgo
+            | DatabaseType::Uxdb
+            | DatabaseType::Vastbase
+            | DatabaseType::Gbase8c
+            | DatabaseType::Kwdb
+    )
+}
+
+fn schema_aware(database_type: DatabaseType) -> bool {
+    database_type == DatabaseType::SqlServer || is_postgres_family(database_type)
+}
+
+pub fn denial_message(decision: &Decision) -> Option<String> {
+    let Decision::Deny(denial) = decision else {
+        return None;
+    };
+    let resource = &denial.resource;
+    let location: Vec<&str> = [resource.database.as_deref(), resource.schema.as_deref(), resource.table.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let target = if location.is_empty() { resource.connection_id.clone() } else { location.join(".") };
+    Some(format!("{PERMISSION_DENIED_PREFIX} {} required on {target}", denial.missing.names().join(", ")))
+}
+
+impl AuthzRuntime {
+    pub fn set_enforced(&self, enforced: bool) {
+        self.enforced.store(enforced, Ordering::Release);
+    }
+
+    pub fn is_enforced(&self) -> bool {
+        self.enforced.load(Ordering::Acquire)
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    pub fn register_owner(&self, owner: &str, principal: Principal) {
+        if read(&self.owners).get(owner) == Some(&principal) {
+            return;
+        }
+        write(&self.owners).insert(owner.to_string(), principal);
+    }
+
+    pub fn forget_owner(&self, owner: &str) {
+        write(&self.owners).remove(owner);
+    }
+
+    pub fn current(&self) -> CurrentPrincipal {
+        if !self.is_enforced() {
+            return CurrentPrincipal::Unenforced;
+        }
+        match current_credential_owner() {
+            None => CurrentPrincipal::Background,
+            Some(owner) => match read(&self.owners).get(&owner) {
+                Some(principal) => CurrentPrincipal::Known(principal.clone()),
+                None => CurrentPrincipal::Unknown,
+            },
+        }
+    }
+
+    pub fn replace_snapshot(&self, snapshot: AuthzSnapshot) {
+        *write(&self.snapshot) = Arc::new(snapshot);
+        self.version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub async fn reload(&self, storage: &Storage) -> Result<(), String> {
+        let snapshot = storage.load_authz_snapshot().await?;
+        self.replace_snapshot(snapshot);
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> Arc<AuthzSnapshot> {
+        read(&self.snapshot).clone()
+    }
+
+    pub fn record_pool_database(&self, pool_key: &str, database: Option<&str>) {
+        let database = database.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+        if read(&self.pool_databases).get(pool_key) == Some(&database) {
+            return;
+        }
+        write(&self.pool_databases).insert(pool_key.to_string(), database);
+    }
+
+    pub fn pool_database(&self, pool_key: &str) -> Option<Option<String>> {
+        read(&self.pool_databases).get(pool_key).cloned()
+    }
+
+    pub fn with_groups(&self, principal: &Principal) -> Principal {
+        match principal {
+            Principal::User { user_id, role, .. } => Principal::User {
+                user_id: user_id.clone(),
+                groups: self.snapshot().memberships.get(user_id).cloned().unwrap_or_default(),
+                role: *role,
+            },
+            other => other.clone(),
+        }
+    }
+
+    pub fn permissions(
+        &self,
+        principal: &Principal,
+        config: &ConnectionConfig,
+        write_unlocked: bool,
+    ) -> EffectivePermissions {
+        let ceiling =
+            if config.read_only && !write_unlocked { Operations::READ_ONLY_CEILING } else { Operations::all() };
+        let snapshot = self.snapshot();
+        compile(
+            &self.with_groups(principal),
+            &snapshot.grants,
+            ConnectionContext { connection_id: &config.id, group_path: &[], ceiling, now: now_millis() },
+        )
+    }
+}
+
+async fn connection_config(state: &AppState, connection_id: &str) -> Option<ConnectionConfig> {
+    state.configs.read().await.get(connection_id).cloned()
+}
+
+async fn principal_permissions(
+    state: &AppState,
+    principal: &Principal,
+    config: &ConnectionConfig,
+) -> EffectivePermissions {
+    let write_unlocked = config.read_only && state.write_unlock_windows.is_active(&config.id).await;
+    state.authz.permissions(principal, config, write_unlocked)
+}
+
+fn missing_principal() -> String {
+    format!("{PERMISSION_DENIED_PREFIX} the request has no authenticated user")
+}
+
+pub async fn principal_can_see_connection(state: &AppState, principal: &Principal, connection_id: &str) -> bool {
+    match connection_config(state, connection_id).await {
+        Some(config) => principal_permissions(state, principal, &config).await.is_visible(),
+        None => false,
+    }
+}
+
+pub async fn authorize_connection_access(state: &AppState, connection_id: &str) -> Result<(), String> {
+    let principal = match state.authz.current() {
+        CurrentPrincipal::Unenforced | CurrentPrincipal::Background => return Ok(()),
+        CurrentPrincipal::Unknown => return Err(missing_principal()),
+        CurrentPrincipal::Known(principal) => principal,
+    };
+    let Some(config) = connection_config(state, connection_id).await else {
+        return Ok(());
+    };
+    if principal_permissions(state, &principal, &config).await.is_visible() {
+        Ok(())
+    } else {
+        Err(format!("{PERMISSION_DENIED_PREFIX} no access to connection {}", config.name))
+    }
+}
+
+pub async fn authorize_connection_operations(
+    state: &AppState,
+    connection_id: &str,
+    operations: Operations,
+) -> Result<(), String> {
+    let principal = match state.authz.current() {
+        CurrentPrincipal::Unenforced => return Ok(()),
+        CurrentPrincipal::Background | CurrentPrincipal::Unknown => return Err(missing_principal()),
+        CurrentPrincipal::Known(principal) => principal,
+    };
+    let Some(config) = connection_config(state, connection_id).await else {
+        return Err(format!("{PERMISSION_DENIED_PREFIX} unknown connection"));
+    };
+    let permissions = principal_permissions(state, &principal, &config).await;
+    let decision = permissions
+        .authorize(&dbx_authz::Requirement::single(Need::within(Resource::connection(config.id.clone()), operations)));
+    match denial_message(&decision) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+pub async fn authorize_sql(state: &AppState, pool_key: &str, statements: &[&str]) -> Result<(), String> {
+    let principal = match state.authz.current() {
+        CurrentPrincipal::Unenforced => return Ok(()),
+        CurrentPrincipal::Background | CurrentPrincipal::Unknown => return Err(missing_principal()),
+        CurrentPrincipal::Known(principal) => principal,
+    };
+    let config = {
+        let configs = state.configs.read().await;
+        crate::connection::config_for_pool_key(pool_key, &configs).cloned()
+    };
+    let Some(config) = config else {
+        return Err(format!("{PERMISSION_DENIED_PREFIX} unknown connection"));
+    };
+    let permissions = principal_permissions(state, &principal, &config).await;
+    let active_database = state
+        .authz
+        .pool_database(pool_key)
+        .unwrap_or(None)
+        .or_else(|| config.database.clone().filter(|database| !database.trim().is_empty()));
+    let context = ResolveContext {
+        connection_id: &config.id,
+        active_database: active_database.as_deref(),
+        default_schema: default_schema(config.db_type),
+        schema_aware: schema_aware(config.db_type),
+    };
+    for sql in statements {
+        let requirement = classify_sql_operations(sql, config.db_type).resolve(&context);
+        if let Some(message) = denial_message(&permissions.authorize(&requirement)) {
+            return Err(message);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::session_credentials::with_credential_owner;
+    use crate::query::{connection_readonly_name, execute_sql_statement_with_options};
+    use dbx_authz::{BuiltinRole, Effect, Grant, PlatformRole, Scope, Subject};
+
+    const CONNECTION: &str = "orders";
+
+    async fn state(read_only: bool) -> (tempfile::TempDir, AppState) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open(&root.path().join("dbx.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, root.path().join("plugins"));
+        let path = root.path().join("orders.db");
+        crate::db::sqlite::connect_path_create_if_missing(path.to_str().unwrap()).await.unwrap();
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": CONNECTION, "name": "Orders", "db_type": "sqlite", "host": path.to_str().unwrap(),
+            "port": 0, "username": "", "password": "", "database": null,
+            "one_time": false, "save_password": false, "read_only": false
+        }))
+        .unwrap();
+        state.configs.write().await.insert(CONNECTION.to_string(), config);
+        for sql in ["CREATE TABLE orders(id INTEGER PRIMARY KEY, status TEXT)", "CREATE TABLE audit(id INTEGER)"] {
+            run(&state, sql).await.unwrap();
+        }
+        if read_only {
+            state.configs.write().await.get_mut(CONNECTION).unwrap().read_only = true;
+        }
+        (root, state)
+    }
+
+    async fn run(state: &AppState, sql: &str) -> Result<(), String> {
+        execute_sql_statement_with_options(state, CONNECTION, "main", sql, None, None, Default::default())
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn run_as(state: &AppState, owner: &str, sql: &str) -> Result<(), String> {
+        with_credential_owner(Some(owner.to_string()), run(state, sql)).await
+    }
+
+    fn user(id: &str) -> Principal {
+        Principal::User { user_id: id.into(), groups: Vec::new(), role: PlatformRole::User }
+    }
+
+    fn grant(id: &str, subject: Subject, scope: Scope, effect: Effect, operations: Operations) -> Grant {
+        Grant { id: id.into(), subject, scope, effect, operations, expires_at: None }
+    }
+
+    fn table(name: &str) -> Scope {
+        Scope::Resource(Resource::connection(CONNECTION).with_database("main").with_table(name))
+    }
+
+    fn enforce(state: &AppState, grants: Vec<Grant>, memberships: &[(&str, &str)]) {
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for (user, group) in memberships {
+            groups.entry(user.to_string()).or_default().push(group.to_string());
+        }
+        state.authz.replace_snapshot(AuthzSnapshot { grants, memberships: groups });
+        state.authz.set_enforced(true);
+        state.authz.register_owner("ana-token", user("ana"));
+        state.authz.register_owner("bob-token", user("bob"));
+        state.authz.register_owner(
+            "root-token",
+            Principal::User { user_id: "root".into(), groups: Vec::new(), role: PlatformRole::Admin },
+        );
+    }
+
+    #[tokio::test]
+    async fn without_enforcement_everything_behaves_as_before() {
+        let (_root, state) = state(false).await;
+        assert!(run(&state, "INSERT INTO orders(status) VALUES ('paid')").await.is_ok());
+        assert!(connection_readonly_name(&state, CONNECTION).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn readers_can_select_but_not_write() {
+        let (_root, state) = state(false).await;
+        enforce(
+            &state,
+            vec![grant(
+                "r",
+                Subject::User("ana".into()),
+                Scope::Resource(Resource::connection(CONNECTION)),
+                Effect::Allow,
+                BuiltinRole::Reader.operations(),
+            )],
+            &[],
+        );
+        assert!(run_as(&state, "ana-token", "SELECT * FROM orders").await.is_ok());
+        let denied = run_as(&state, "ana-token", "DELETE FROM orders").await.unwrap_err();
+        assert!(denied.contains("Permission denied: DELETE required on main.orders"), "{denied}");
+        assert!(run_as(&state, "ana-token", "INSERT INTO orders(status) VALUES ('x')").await.is_err());
+        assert!(run_as(&state, "ana-token", "DROP TABLE audit").await.is_err());
+        assert!(connection_readonly_name(&state, CONNECTION)
+            .await
+            .is_some_and(|name| name.contains("no authenticated user")));
+        assert!(with_credential_owner(Some("ana-token".into()), connection_readonly_name(&state, CONNECTION))
+            .await
+            .is_some_and(|name| name.contains("UNCLASSIFIED")));
+    }
+
+    #[tokio::test]
+    async fn group_editors_with_a_table_deny_cannot_touch_that_table() {
+        let (_root, state) = state(false).await;
+        enforce(
+            &state,
+            vec![
+                grant(
+                    "g",
+                    Subject::Group("soporte".into()),
+                    Scope::All,
+                    Effect::Allow,
+                    BuiltinRole::FullEditor.operations(),
+                ),
+                grant(
+                    "d",
+                    Subject::User("ana".into()),
+                    table("audit"),
+                    Effect::Deny,
+                    Operations::DELETE | Operations::UPDATE,
+                ),
+            ],
+            &[("ana", "soporte")],
+        );
+        assert!(run_as(&state, "ana-token", "DELETE FROM orders").await.is_ok());
+        assert!(run_as(&state, "ana-token", "UPDATE orders SET status = 'x'").await.is_ok());
+        assert!(run_as(&state, "ana-token", "INSERT INTO audit VALUES (1)").await.is_ok());
+        assert!(run_as(&state, "ana-token", "DELETE FROM audit").await.unwrap_err().contains("main.audit"));
+        assert!(run_as(&state, "ana-token", "ALTER TABLE orders ADD COLUMN x INT").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn users_without_grants_cannot_even_open_the_connection() {
+        let (_root, state) = state(false).await;
+        enforce(&state, Vec::new(), &[]);
+        let denied = run_as(&state, "bob-token", "SELECT 1").await.unwrap_err();
+        assert!(denied.contains("no access to connection Orders"), "{denied}");
+        assert!(!principal_can_see_connection(&state, &user("bob"), CONNECTION).await);
+    }
+
+    #[tokio::test]
+    async fn administrators_keep_full_access_and_unknown_requests_are_denied() {
+        let (_root, state) = state(false).await;
+        enforce(&state, Vec::new(), &[]);
+        assert!(run_as(&state, "root-token", "DELETE FROM orders").await.is_ok());
+        assert!(with_credential_owner(Some("root-token".into()), connection_readonly_name(&state, CONNECTION))
+            .await
+            .is_none());
+        let unknown = run_as(&state, "forged-token", "SELECT 1").await.unwrap_err();
+        assert!(unknown.contains("no authenticated user"), "{unknown}");
+        let background = run(&state, "SELECT 1").await.unwrap_err();
+        assert!(background.contains("no authenticated user"), "{background}");
+        state.authz.forget_owner("root-token");
+        assert!(run_as(&state, "root-token", "SELECT 1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_only_connections_cap_writes_until_a_write_window_opens() {
+        let (_root, state) = state(true).await;
+        enforce(
+            &state,
+            vec![grant("e", Subject::User("ana".into()), Scope::All, Effect::Allow, BuiltinRole::Editor.operations())],
+            &[],
+        );
+        assert!(run_as(&state, "ana-token", "SELECT * FROM orders").await.is_ok());
+        assert!(run_as(&state, "ana-token", "INSERT INTO orders(status) VALUES ('x')").await.is_err());
+        with_credential_owner(Some("ana-token".into()), async {
+            crate::query::unlock_connection_writes_core(&state, CONNECTION, 60).await.unwrap();
+        })
+        .await;
+        assert!(run_as(&state, "ana-token", "INSERT INTO orders(status) VALUES ('x')").await.is_ok());
+        assert!(run_as(&state, "ana-token", "DELETE FROM orders").await.is_err());
+    }
+
+    #[test]
+    fn denial_messages_name_the_missing_operation_and_place() {
+        let decision = Decision::Deny(dbx_authz::Denial {
+            resource: Resource::connection("c").with_database("app").with_schema("public").with_table("t"),
+            missing: Operations::INSERT | Operations::UPDATE,
+            denied_by: None,
+            limited_by_ceiling: false,
+        });
+        assert_eq!(denial_message(&decision).unwrap(), "Permission denied: INSERT, UPDATE required on app.public.t");
+        assert!(denial_message(&Decision::Allow).is_none());
+    }
+}

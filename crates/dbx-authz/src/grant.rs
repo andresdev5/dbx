@@ -42,7 +42,7 @@ impl Grant {
         self.expires_at.is_none_or(|expires_at| expires_at > now)
     }
 
-    pub(crate) fn pattern_for(&self, connection_id: &str, group_path: &[String]) -> Option<Resource> {
+    pub fn pattern_for(&self, connection_id: &str, group_path: &[String]) -> Option<Resource> {
         match &self.scope {
             Scope::All => Some(Resource::connection(connection_id)),
             Scope::ConnectionGroup(group) => {

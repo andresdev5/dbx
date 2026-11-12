@@ -492,6 +492,7 @@ pub struct AppState {
     pub session_credentials: SessionCredentialStore,
     /// In-memory, never-persisted 1/5 minute write overrides for read-only connections.
     pub write_unlock_windows: crate::write_unlock::WriteUnlockWindows,
+    pub authz: crate::authz::AuthzRuntime,
     pub native_jobs: crate::schema::native_jobs::NativeJobRegistry,
     metadata_gates: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     /// Backend-confirmed liveness losses plus resync requests (#4339). The keepalive task
@@ -2127,6 +2128,7 @@ impl AppState {
             sqlserver_transaction_ends: Arc::new(std::sync::Mutex::new(Default::default())),
             session_credentials: SessionCredentialStore::new(),
             write_unlock_windows: crate::write_unlock::WriteUnlockWindows::default(),
+            authz: crate::authz::AuthzRuntime::default(),
             native_jobs: crate::schema::native_jobs::NativeJobRegistry::default(),
             metadata_gates: Arc::new(Mutex::new(HashMap::new())),
             // Bounded so a shell that stops draining cannot grow memory without bound. A
@@ -3479,6 +3481,7 @@ impl AppState {
         session_role: AgentSessionRole,
         connection_attempt: Option<u64>,
     ) -> Result<ConnectionPoolReceipt, String> {
+        crate::authz::authorize_connection_access(self, connection_id).await?;
         let config = {
             let configs = self.configs.read().await;
             configs.get(connection_id).ok_or("Connection config not found")?.clone()
@@ -3489,6 +3492,8 @@ impl AppState {
 
         let base_pool_key = base_pool_key_for_config(Some(&config), connection_id, database, catalog, false);
         let pool_key = pool_key_for_session_role(Some(&config), base_pool_key.clone(), client_session_id, session_role);
+        self.authz.record_pool_database(&base_pool_key, database);
+        self.authz.record_pool_database(&pool_key, database);
 
         loop {
             self.wait_for_pool_drain(&pool_key).await;

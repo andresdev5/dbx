@@ -211,6 +211,9 @@ const patterns: [RegExp, string][] = [
   [/^self_modification_not_allowed$/, "auth.selfModificationNotAllowed"],
   [/^user_not_found$/, "auth.userNotFound"],
   [/^display_name_invalid$/, "auth.displayNameInvalid"],
+  [/^Permission denied: no access to connection (.+)$/, "auth.connectionAccessDenied"],
+  [/^Permission denied: (.+) required on (.+)$/, "auth.permissionDenied"],
+  [/^Permission denied: the request has no authenticated user$/, "auth.sessionExpired"],
 
   // Dameng native dexp/dimp dump (crates/dbx-core/src/data/dameng_dump.rs)
   [/^\[damengToolNotFound\]/, "damengDump.errors.toolNotFound"],
@@ -246,6 +249,8 @@ const paramNames: Record<string, string | string[]> = {
   "driverStore.driverUpdateBlocked": "labels",
   "common.fileNotFound": "path",
   "auth.rateLimited": "seconds",
+  "auth.connectionAccessDenied": "name",
+  "auth.permissionDenied": ["operations", "target"],
 };
 
 function backendErrorMessage(error: unknown): string {

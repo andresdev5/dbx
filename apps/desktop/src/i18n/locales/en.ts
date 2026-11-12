@@ -1102,6 +1102,8 @@ export default {
     selfModificationNotAllowed: "You cannot do this to your own account",
     userNotFound: "The user no longer exists",
     displayNameInvalid: "The display name is not valid",
+    permissionDenied: "You do not have permission for {operations} on {target}",
+    connectionAccessDenied: "You do not have access to the connection {name}",
     username: "Username",
     newUsername: "Administrator username",
     setupToken: "Setup token",

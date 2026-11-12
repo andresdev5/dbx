@@ -244,5 +244,8 @@ pub async fn delete(
     reject_self(&admin, &body.id)?;
     end_all_sessions(&state, &body.id).await;
     state.app.storage.delete_web_user(&body.id).await.map_err(AdminError::storage)?;
+    if let Err(error) = state.app.authz.reload(&state.app.storage).await {
+        log::error!("Failed to reload DBX Web permissions after deleting a user: {error}");
+    }
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }

@@ -4,9 +4,14 @@ pub use dbx_drivers::runtime_config::{
 };
 
 mod type_execution_receipts;
+mod web_grants;
 mod web_users;
-pub use web_users::{NewWebUser, WebSession, WebUser, LAST_ADMIN, USERNAME_TAKEN, USER_NOT_FOUND};
 pub use type_execution_receipts::{TypeExecutionBinding, TypeRecoveryContext};
+pub use web_grants::{
+    builtin_role_id, builtin_roles, AuthzSnapshot, DataRole, StoredGrant, UserGroup, GRANT_INVALID, GRANT_NOT_FOUND,
+    GROUP_NAME_TAKEN, GROUP_NOT_FOUND, ROLE_IN_USE, ROLE_NAME_TAKEN, ROLE_NOT_FOUND,
+};
+pub use web_users::{NewWebUser, WebSession, WebUser, LAST_ADMIN, USERNAME_TAKEN, USER_NOT_FOUND};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -2691,7 +2696,11 @@ impl Storage {
     async fn init_schema(&self, migrate_legacy: bool) -> Result<(), String> {
         let migration_codec = migrate_legacy.then(|| self.secret_codec(true)).transpose()?;
         self.db.with_connection(move |conn| {
-            for statement in SCHEMA_STATEMENTS.iter().chain(web_users::WEB_USER_SCHEMA_STATEMENTS) {
+            for statement in SCHEMA_STATEMENTS
+                .iter()
+                .chain(web_users::WEB_USER_SCHEMA_STATEMENTS)
+                .chain(web_grants::WEB_GRANT_SCHEMA_STATEMENTS)
+            {
                 conn.execute(statement, []).map_err(|e| e.to_string())?;
             }
             ensure_history_columns_sync(conn)?;

@@ -159,6 +159,7 @@ pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn forget_live_session(state: &WebState, token: &str) {
+    state.app.authz.forget_owner(token);
     let removed = {
         let mut sessions = state.sessions.write().await;
         let removed = sessions.remove(token);
@@ -508,7 +509,9 @@ pub async fn auth_middleware(
     if !state.sessions.read().await.contains(&token) {
         state.sessions.write().await.insert(token.clone());
     }
-    req.extensions_mut().insert(Principal::User { user_id: user.user_id.clone(), groups: Vec::new(), role: user.role });
+    let principal = Principal::User { user_id: user.user_id.clone(), groups: Vec::new(), role: user.role };
+    state.app.authz.register_owner(&token, principal.clone());
+    req.extensions_mut().insert(principal);
     req.extensions_mut().insert(user);
     let owner = token;
     dbx_core::session_credentials::with_credential_owner(Some(owner), async move { next.run(req).await }).await

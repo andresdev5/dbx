@@ -1038,6 +1038,8 @@ export default withEnglishFallback({
     selfModificationNotAllowed: "不能对自己的账号执行此操作",
     userNotFound: "该用户已不存在",
     displayNameInvalid: "显示名称无效",
+    permissionDenied: "你没有对 {target} 执行 {operations} 的权限",
+    connectionAccessDenied: "你无权访问连接 {name}",
     username: "用户名",
     newUsername: "管理员用户名",
     setupToken: "初始化令牌",

@@ -319,6 +319,10 @@ impl Storage {
             let transaction = conn.transaction().map_err(sql_error)?;
             ensure_not_last_active_admin(&transaction, &id)?;
             transaction.execute("DELETE FROM user_sessions WHERE user_id = ?1", params![id]).map_err(sql_error)?;
+            transaction
+                .execute("DELETE FROM grants WHERE principal_kind = 'user' AND principal_id = ?1", params![id])
+                .map_err(sql_error)?;
+            transaction.execute("DELETE FROM user_group_members WHERE user_id = ?1", params![id]).map_err(sql_error)?;
             let changed = transaction.execute("DELETE FROM users WHERE id = ?1", params![id]).map_err(sql_error)?;
             if changed == 0 {
                 return Err(USER_NOT_FOUND.to_string());

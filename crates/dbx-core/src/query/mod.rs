@@ -879,6 +879,7 @@ fn error_from_query_result(result: &db::QueryResult) -> Option<crate::backend_er
 /// Uses config_for_pool_key to correctly resolve configs when pool_key includes
 /// a database suffix (e.g., "prod:app" → config stored under "prod").
 pub async fn check_read_only_for_connection(state: &AppState, pool_key: &str, sql: &str) -> Result<(), String> {
+    crate::authz::authorize_sql(state, pool_key, &[sql]).await?;
     if mysql_data_charset_policy::enabled_for_connection(state, pool_key).await? {
         return mysql_data_charset_policy::check_sql(sql, pool_key);
     }
@@ -902,6 +903,8 @@ pub async fn check_read_only_for_connection_multi(
     pool_key: &str,
     statements: &[impl AsRef<str>],
 ) -> Result<(), String> {
+    let texts: Vec<&str> = statements.iter().map(|statement| statement.as_ref()).collect();
+    crate::authz::authorize_sql(state, pool_key, &texts).await?;
     if mysql_data_charset_policy::enabled_for_connection(state, pool_key).await? {
         for sql in statements {
             mysql_data_charset_policy::check_sql(sql.as_ref(), pool_key)?;
@@ -932,6 +935,11 @@ pub async fn connection_readonly_name(state: &AppState, connection_id: &str) -> 
     // legacy action boundary; connection setup reports the validation details.
     if mysql_data_charset_policy::enabled_for_connection(state, connection_id).await.unwrap_or(true) {
         return Some(format!("{connection_id} (MySQL dataCharset read-only)"));
+    }
+    if let Err(message) =
+        crate::authz::authorize_connection_operations(state, connection_id, dbx_authz::Operations::UNCLASSIFIED).await
+    {
+        return Some(format!("{connection_id} ({message})"));
     }
     let name = {
         let configs = state.configs.read().await;

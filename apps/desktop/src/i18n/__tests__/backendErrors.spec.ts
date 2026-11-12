@@ -723,3 +723,13 @@ describe("backend error wording is pinned to the Rust sources", () => {
     expect(rust(path)).toContain(fragment);
   });
 });
+
+describe("permission denials from the authorization engine", () => {
+  test("names the missing operations and where they are needed", () => {
+    const t = ((key: string, named?: Record<string, unknown>) => (named ? `${key}:${JSON.stringify(named)}` : key)) as BackendErrorTranslate;
+    expect(translateBackendError(t, "Permission denied: DELETE, UPDATE required on app.public.orders")).toBe(
+      'auth.permissionDenied:{"operations":"DELETE, UPDATE","target":"app.public.orders"}',
+    );
+    expect(translateBackendError(t, "Permission denied: no access to connection Ventas")).toBe('auth.connectionAccessDenied:{"name":"Ventas"}');
+  });
+});

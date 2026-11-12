@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod ai;
+pub mod authz;
 pub mod cc_switch;
 pub mod data;
 pub mod host;
@@ -122,6 +123,7 @@ pub use dbx_sql::sql_diagnostics;
 pub use dbx_sql::sql_dialect;
 pub use dbx_sql::sql_editability;
 pub use dbx_sql::sql_error_position;
+pub use dbx_sql::sql_operations;
 pub use dbx_sql::sql_parser;
 pub use dbx_sql::sql_risk;
 pub(crate) use dbx_sql::sqlserver_temporal;

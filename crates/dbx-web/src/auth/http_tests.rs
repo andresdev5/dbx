@@ -115,6 +115,16 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/admin/users/set-active", post(crate::routes::admin_users::set_active))
         .route("/api/admin/users/reset-password", post(crate::routes::admin_users::reset_password))
         .route("/api/admin/users/delete", post(crate::routes::admin_users::delete))
+        .route("/api/admin/groups/create", post(crate::routes::admin_access::create_group))
+        .route("/api/admin/groups/set-members", post(crate::routes::admin_access::set_group_members))
+        .route("/api/admin/roles/list", post(crate::routes::admin_access::list_roles))
+        .route("/api/admin/roles/create", post(crate::routes::admin_access::create_role))
+        .route("/api/admin/roles/update", post(crate::routes::admin_access::update_role))
+        .route("/api/admin/grants/save", post(crate::routes::admin_access::save_grant))
+        .route("/api/admin/grants/list", post(crate::routes::admin_access::list_grants))
+        .route("/api/admin/grants/delete", post(crate::routes::admin_access::delete_grant))
+        .route("/api/admin/grants/effective", post(crate::routes::admin_access::effective))
+        .route("/api/connection/list", get(crate::routes::connection::load_connections))
         .fallback(|| async { "handled" })
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
@@ -518,4 +528,140 @@ async fn administrators_cannot_lock_themselves_out() {
         )
         .await;
     assert_eq!(renamed.body["display_name"], "Root");
+}
+
+async fn save_sqlite_connection(state: &WebState, id: &str, directory: &Path) {
+    let path = directory.join(format!("{id}.db"));
+    let config: dbx_core::models::connection::ConnectionConfig = serde_json::from_value(json!({
+        "id": id, "name": id, "db_type": "sqlite", "host": path.to_str().unwrap(),
+        "port": 0, "username": "", "password": "", "database": null,
+        "one_time": false, "save_password": false, "read_only": false
+    }))
+    .unwrap();
+    let mut existing = state.app.storage.load_connections().await.unwrap();
+    existing.push(config);
+    state.app.storage.save_connections(&existing).await.unwrap();
+}
+
+fn connection_ids(reply: &Reply) -> Vec<String> {
+    let mut ids: Vec<String> = reply
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|connection| connection["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn grants_managed_through_the_api_decide_which_connections_each_user_sees() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    state.app.authz.set_enforced(true);
+    create_user(&state, "ana", "ana-password", false).await;
+    create_user(&state, "bob", "bob-password", false).await;
+    save_sqlite_connection(&state, "ventas", directory.path()).await;
+    save_sqlite_connection(&state, "rrhh", directory.path()).await;
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let ana = server.login("ana", "ana-password").await.cookie.unwrap();
+    let bob = server.login("bob", "bob-password").await.cookie.unwrap();
+    let ana_id = state.app.storage.find_web_user_by_username("ana").await.unwrap().unwrap().id;
+
+    assert_eq!(connection_ids(&server.get("/api/connection/list", Some(&admin)).await), vec!["rrhh", "ventas"]);
+    assert!(connection_ids(&server.get("/api/connection/list", Some(&ana)).await).is_empty());
+
+    let group = server.post("/api/admin/groups/create", Some(&admin), json!({ "name": "Ventas" })).await;
+    let group_id = group.body["id"].as_str().unwrap().to_string();
+    server.post("/api/admin/groups/set-members", Some(&admin), json!({ "id": group_id, "user_ids": [ana_id] })).await;
+    let saved = server
+        .post(
+            "/api/admin/grants/save",
+            Some(&admin),
+            json!({
+                "subject": { "kind": "group", "id": group_id },
+                "scope": { "kind": "resource", "value": { "connectionId": "ventas" } },
+                "effect": "allow",
+                "role_id": "builtin:reader"
+            }),
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+
+    assert_eq!(connection_ids(&server.get("/api/connection/list", Some(&ana)).await), vec!["ventas"]);
+    assert!(connection_ids(&server.get("/api/connection/list", Some(&bob)).await).is_empty());
+
+    let effective = server
+        .post("/api/admin/grants/effective", Some(&admin), json!({ "user_id": ana_id, "connection_id": "ventas" }))
+        .await;
+    assert_eq!(effective.body["visible"], true);
+    assert_eq!(effective.body["connection_operations"], json!(["SELECT"]));
+    assert_eq!(effective.body["rules"][0]["via_group"], json!(group_id));
+
+    let grant_id = saved.body["id"].as_str().unwrap().to_string();
+    server.post("/api/admin/grants/delete", Some(&admin), json!({ "id": grant_id })).await;
+    assert!(connection_ids(&server.get("/api/connection/list", Some(&ana)).await).is_empty());
+}
+
+#[tokio::test]
+async fn custom_roles_and_grant_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    save_sqlite_connection(&state, "ventas", directory.path()).await;
+    state.app.configs.write().await.extend(
+        state.app.storage.load_connections().await.unwrap().into_iter().map(|config| (config.id.clone(), config)),
+    );
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+
+    let roles = server.post("/api/admin/roles/list", Some(&admin), json!({})).await;
+    assert_eq!(roles.body.as_array().unwrap().len(), 6);
+    let bad =
+        server.post("/api/admin/roles/create", Some(&admin), json!({ "name": "X", "operations": ["SELEKT"] })).await;
+    assert_eq!(bad.body["error"], "operation_invalid");
+    let role = server
+        .post("/api/admin/roles/create", Some(&admin), json!({ "name": "Auditor", "operations": ["select", "EXPORT"] }))
+        .await;
+    assert_eq!(role.body["operations"], json!(["SELECT", "EXPORT"]));
+    let builtin = server
+        .post("/api/admin/roles/update", Some(&admin), json!({ "id": "builtin:reader", "name": "x", "operations": [] }))
+        .await;
+    assert_eq!(builtin.body["error"], "role_builtin");
+
+    let ghost = server
+        .post(
+            "/api/admin/grants/save",
+            Some(&admin),
+            json!({ "subject": { "kind": "user", "id": "ghost" }, "scope": { "kind": "all" }, "effect": "allow", "operations": ["SELECT"] }),
+        )
+        .await;
+    assert_eq!(ghost.body["error"], "subject_not_found");
+    let unknown_connection = server
+        .post(
+            "/api/admin/grants/save",
+            Some(&admin),
+            json!({ "subject": { "kind": "system" }, "scope": { "kind": "resource", "value": { "connectionId": "nope" } }, "effect": "allow", "operations": ["SELECT"] }),
+        )
+        .await;
+    assert_eq!(unknown_connection.body["error"], "connection_not_found");
+    let incoherent = server
+        .post(
+            "/api/admin/grants/save",
+            Some(&admin),
+            json!({ "subject": { "kind": "system" }, "scope": { "kind": "resource", "value": { "connectionId": "ventas", "schema": "s" } }, "effect": "allow", "operations": ["SELECT"] }),
+        )
+        .await;
+    assert_eq!(incoherent.body["error"], "grant_invalid");
+    let system = server
+        .post(
+            "/api/admin/grants/save",
+            Some(&admin),
+            json!({ "subject": { "kind": "system" }, "scope": { "kind": "resource", "value": { "connectionId": "ventas", "database": "main" } }, "effect": "allow", "role_id": role.body["id"] }),
+        )
+        .await;
+    assert_eq!(system.status, StatusCode::OK, "{:?}", system.body);
+    let listed = server.post("/api/admin/grants/list", Some(&admin), json!({ "subject": { "kind": "system" } })).await;
+    assert_eq!(listed.body.as_array().unwrap().len(), 1);
 }

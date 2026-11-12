@@ -618,6 +618,13 @@ async fn serve() -> Result<(), String> {
         }
     };
 
+    if !password_disabled {
+        app_state.authz.set_enforced(true);
+        if let Err(error) = app_state.authz.reload(&app_state.storage).await {
+            log::error!("Failed to load DBX Web permissions; only administrators keep access: {error}");
+        }
+    }
+
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
 
     // `DBX_WEB_CAPTCHA` pins the policy for managed deployments; otherwise the
@@ -713,6 +720,19 @@ async fn serve() -> Result<(), String> {
         .route("/admin/users/set-active", post(routes::admin_users::set_active))
         .route("/admin/users/reset-password", post(routes::admin_users::reset_password))
         .route("/admin/users/delete", post(routes::admin_users::delete))
+        .route("/admin/groups/list", post(routes::admin_access::list_groups))
+        .route("/admin/groups/create", post(routes::admin_access::create_group))
+        .route("/admin/groups/update", post(routes::admin_access::update_group))
+        .route("/admin/groups/set-members", post(routes::admin_access::set_group_members))
+        .route("/admin/groups/delete", post(routes::admin_access::delete_group))
+        .route("/admin/roles/list", post(routes::admin_access::list_roles))
+        .route("/admin/roles/create", post(routes::admin_access::create_role))
+        .route("/admin/roles/update", post(routes::admin_access::update_role))
+        .route("/admin/roles/delete", post(routes::admin_access::delete_role))
+        .route("/admin/grants/list", post(routes::admin_access::list_grants))
+        .route("/admin/grants/save", post(routes::admin_access::save_grant))
+        .route("/admin/grants/delete", post(routes::admin_access::delete_grant))
+        .route("/admin/grants/effective", post(routes::admin_access::effective))
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))
