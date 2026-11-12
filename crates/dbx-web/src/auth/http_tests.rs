@@ -108,7 +108,14 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/auth/setup", post(setup))
         .route("/api/auth/change-password", post(change_password))
         .route("/api/auth/logout", post(logout))
-        .route("/api/protected", get(|| async { "secret" }).post(|| async { "written" }))
+        .route("/api/query/execute", get(|| async { "secret" }).post(|| async { "written" }))
+        .route("/api/admin/users/list", post(crate::routes::admin_users::list))
+        .route("/api/admin/users/create", post(crate::routes::admin_users::create))
+        .route("/api/admin/users/update", post(crate::routes::admin_users::update))
+        .route("/api/admin/users/set-active", post(crate::routes::admin_users::set_active))
+        .route("/api/admin/users/reset-password", post(crate::routes::admin_users::reset_password))
+        .route("/api/admin/users/delete", post(crate::routes::admin_users::delete))
+        .fallback(|| async { "handled" })
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -153,7 +160,7 @@ async fn login_with_username_opens_a_session_that_only_stores_its_hash() {
     assert!(state.app.storage.find_web_session(token).await.unwrap().is_none());
     assert!(state.app.storage.find_web_session(&hash_token(token)).await.unwrap().is_some());
 
-    assert_eq!(server.get("/api/protected", Some(&cookie)).await.body, "secret");
+    assert_eq!(server.get("/api/query/execute", Some(&cookie)).await.body, "secret");
     let check = server.get("/api/auth/check", Some(&cookie)).await;
     assert_eq!(check.body["authenticated"], true);
     assert_eq!(check.body["user"]["username"], "admin");
@@ -213,15 +220,15 @@ async fn sessions_survive_a_server_restart_until_logout() {
     drop(first);
 
     let restarted = serve(open_state(directory.path(), |_| {}).await).await;
-    assert_eq!(restarted.get("/api/protected", Some(&cookie)).await.status, StatusCode::OK);
+    assert_eq!(restarted.get("/api/query/execute", Some(&cookie)).await.status, StatusCode::OK);
     assert_eq!(restarted.post("/api/auth/logout", Some(&cookie), json!({})).await.status, StatusCode::OK);
-    let after = restarted.get("/api/protected", Some(&cookie)).await;
+    let after = restarted.get("/api/query/execute", Some(&cookie)).await;
     assert_eq!(after.status, StatusCode::UNAUTHORIZED);
     assert_eq!(after.body["error"], SESSION_EXPIRED);
     drop(restarted);
 
     let again = serve(open_state(directory.path(), |_| {}).await).await;
-    assert_eq!(again.get("/api/protected", Some(&cookie)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(again.get("/api/query/execute", Some(&cookie)).await.status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -236,7 +243,7 @@ async fn forced_password_change_blocks_the_api_until_done_and_revokes_other_sess
     assert_eq!(reply.body["must_change_password"], true);
     let current = reply.cookie.unwrap();
 
-    let blocked = server.get("/api/protected", Some(&current)).await;
+    let blocked = server.get("/api/query/execute", Some(&current)).await;
     assert_eq!(blocked.status, StatusCode::FORBIDDEN);
     assert_eq!(blocked.body["error"], PASSWORD_CHANGE_REQUIRED);
     assert_eq!(server.get("/api/auth/check", Some(&current)).await.body["user"]["must_change_password"], true);
@@ -253,8 +260,8 @@ async fn forced_password_change_blocks_the_api_until_done_and_revokes_other_sess
         server.post("/api/auth/change-password", Some(&current), change("initial-password", "better-password")).await;
     assert_eq!(ok.status, StatusCode::OK);
 
-    assert_eq!(server.get("/api/protected", Some(&current)).await.status, StatusCode::OK);
-    assert_eq!(server.get("/api/protected", Some(&other)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(server.get("/api/query/execute", Some(&current)).await.status, StatusCode::OK);
+    assert_eq!(server.get("/api/query/execute", Some(&other)).await.status, StatusCode::UNAUTHORIZED);
     assert_eq!(server.login("ana", "initial-password").await.status, StatusCode::UNAUTHORIZED);
     assert_eq!(server.login("ana", "better-password").await.body["must_change_password"], false);
     let other_token = other.strip_prefix("dbx_session=").unwrap();
@@ -279,7 +286,7 @@ async fn first_administrator_needs_the_setup_token_from_the_log() {
     drop(state);
     let server = serve(state_without_users.clone()).await;
 
-    assert_eq!(server.get("/api/protected", None).await.body["error"], SETUP_REQUIRED);
+    assert_eq!(server.get("/api/query/execute", None).await.body["error"], SETUP_REQUIRED);
     let check = server.get("/api/auth/check", None).await;
     assert_eq!(check.body["setup_required"], true);
     let token = state_without_users.setup_token.peek().unwrap();
@@ -296,7 +303,7 @@ async fn first_administrator_needs_the_setup_token_from_the_log() {
     assert_eq!(created.status, StatusCode::OK);
     assert_eq!(created.body["user"]["role"], "admin");
     let cookie = created.cookie.unwrap();
-    assert_eq!(server.get("/api/protected", Some(&cookie)).await.status, StatusCode::OK);
+    assert_eq!(server.get("/api/query/execute", Some(&cookie)).await.status, StatusCode::OK);
     assert!(state_without_users.users_configured.load(Ordering::Acquire));
     assert!(state_without_users.setup_token.peek().is_none());
 
@@ -318,7 +325,7 @@ async fn cross_site_writes_are_rejected_before_anything_else() {
     let same_origin =
         server.send("POST", "/api/auth/login", None, Some(body), &[("sec-fetch-site", "same-origin")]).await;
     assert_eq!(same_origin.status, StatusCode::OK);
-    let read = server.send("GET", "/api/protected", None, None, &[("sec-fetch-site", "cross-site")]).await;
+    let read = server.send("GET", "/api/query/execute", None, None, &[("sec-fetch-site", "cross-site")]).await;
     assert_eq!(read.body["error"], SESSION_EXPIRED);
 }
 
@@ -326,7 +333,7 @@ async fn cross_site_writes_are_rejected_before_anything_else() {
 async fn api_requires_a_valid_session() {
     let directory = tempfile::tempdir().unwrap();
     let server = serve(open_state(directory.path(), |_| {}).await).await;
-    let reply = server.get("/api/protected", Some("dbx_session=forged")).await;
+    let reply = server.get("/api/query/execute", Some("dbx_session=forged")).await;
     assert_eq!((reply.status, reply.body["error"].clone()), (StatusCode::UNAUTHORIZED, json!(SESSION_EXPIRED)));
 }
 
@@ -334,8 +341,181 @@ async fn api_requires_a_valid_session() {
 async fn disabled_password_mode_skips_login_entirely() {
     let directory = tempfile::tempdir().unwrap();
     let server = serve(open_state(directory.path(), |state| state.password_disabled = true).await).await;
-    assert_eq!(server.get("/api/protected", None).await.body, "secret");
+    assert_eq!(server.get("/api/query/execute", None).await.body, "secret");
     let check = server.get("/api/auth/check", None).await;
     assert_eq!((check.body["authenticated"].clone(), check.body["required"].clone()), (json!(true), json!(false)));
     assert_eq!(server.login("admin", ADMIN_PASSWORD).await.body["error"], "login_not_required");
+}
+
+async fn send_method(server: &Server, method: &str, path: &str, cookie: &str) -> Reply {
+    let url = format!("http://{}{path}", server.address);
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+    let response = server.client.request(method, url).header("cookie", cookie).json(&json!({})).send().await.unwrap();
+    let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+    let text = response.text().await.unwrap();
+    Reply { status, cookie: None, body: serde_json::from_str(&text).unwrap_or(Value::String(text)) }
+}
+
+#[tokio::test]
+async fn a_regular_user_gets_admin_required_on_every_admin_route() {
+    use crate::route_policy::test_support::{concrete, registered_routes};
+    use crate::route_policy::{classify, RouteClass};
+
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    create_user(&state, "ana", "ana-password", false).await;
+    let server = serve(state).await;
+    let user = server.login("ana", "ana-password").await.cookie.unwrap();
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+
+    let mut checked = 0;
+    for route in registered_routes() {
+        if route.starts_with("/admin/") {
+            continue;
+        }
+        let path = concrete(&route);
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let parsed = axum::http::Method::from_bytes(method.as_bytes()).unwrap();
+            if classify(&parsed, &path) != Some(RouteClass::Admin) {
+                continue;
+            }
+            let denied = send_method(&server, method, &format!("/api/{path}"), &user).await;
+            assert_eq!(
+                (denied.status, denied.body["error"].clone()),
+                (StatusCode::FORBIDDEN, json!(ADMIN_REQUIRED)),
+                "{method} {route}"
+            );
+            let allowed = send_method(&server, method, &format!("/api/{path}"), &admin).await;
+            assert_eq!(allowed.body, "handled", "{method} {route}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 50, "only {checked} admin routes were checked");
+
+    for path in ["list", "create", "update", "set-active", "reset-password", "delete"] {
+        let denied = server.post(&format!("/api/admin/users/{path}"), Some(&user), json!({})).await;
+        assert_eq!(denied.body["error"], ADMIN_REQUIRED, "{path}");
+    }
+    assert_eq!(server.post("/api/query/execute", Some(&user), json!({})).await.body, "written");
+}
+
+#[tokio::test]
+async fn unclassified_routes_are_rejected_even_for_admins() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = serve(open_state(directory.path(), |_| {}).await).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let reply = server.post("/api/brand-new/feature", Some(&admin), json!({})).await;
+    assert_eq!((reply.status, reply.body["error"].clone()), (StatusCode::FORBIDDEN, json!(ROUTE_NOT_CLASSIFIED)));
+}
+
+#[tokio::test]
+async fn administrators_manage_the_full_user_lifecycle() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+
+    let created = server
+        .post(
+            "/api/admin/users/create",
+            Some(&admin),
+            json!({ "username": "ana", "display_name": " Ana ", "role": "user" }),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert_eq!(created.body["user"]["display_name"], "Ana");
+    assert_eq!(created.body["user"]["must_change_password"], true);
+    let temporary = created.body["temporary_password"].as_str().unwrap().to_string();
+    let ana_id = created.body["user"]["id"].as_str().unwrap().to_string();
+
+    let duplicate =
+        server.post("/api/admin/users/create", Some(&admin), json!({ "username": "ANA", "role": "user" })).await;
+    assert_eq!((duplicate.status, duplicate.body["error"].clone()), (StatusCode::CONFLICT, json!("username_taken")));
+    let weak = server
+        .post(
+            "/api/admin/users/create",
+            Some(&admin),
+            json!({ "username": "bob", "role": "user", "password": "short" }),
+        )
+        .await;
+    assert_eq!(weak.body["error"], "password_too_short");
+    let chosen = server
+        .post(
+            "/api/admin/users/create",
+            Some(&admin),
+            json!({ "username": "bob", "role": "user", "password": "bob-password", "must_change_password": false }),
+        )
+        .await;
+    assert!(chosen.body.get("temporary_password").is_none());
+    assert_eq!(chosen.body["user"]["must_change_password"], false);
+
+    let listed = server.post("/api/admin/users/list", Some(&admin), json!({})).await;
+    let names: Vec<&str> =
+        listed.body.as_array().unwrap().iter().map(|user| user["username"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["admin", "ana", "bob"]);
+
+    let ana = server.login("ana", &temporary).await;
+    assert_eq!(ana.body["must_change_password"], true);
+    let ana_cookie = ana.cookie.unwrap();
+
+    let promoted = server
+        .post(
+            "/api/admin/users/update",
+            Some(&admin),
+            json!({ "id": ana_id, "display_name": "Ana P.", "role": "admin" }),
+        )
+        .await;
+    assert_eq!(promoted.body["role"], "admin");
+    assert_eq!(server.get("/api/auth/check", Some(&ana_cookie)).await.body["user"]["role"], "admin");
+
+    let disabled =
+        server.post("/api/admin/users/set-active", Some(&admin), json!({ "id": ana_id, "active": false })).await;
+    assert_eq!(disabled.body["active"], false);
+    assert_eq!(server.get("/api/auth/check", Some(&ana_cookie)).await.body["authenticated"], false);
+    assert_eq!(server.login("ana", &temporary).await.status, StatusCode::UNAUTHORIZED);
+    server.post("/api/admin/users/set-active", Some(&admin), json!({ "id": ana_id, "active": true })).await;
+
+    let reset = server.post("/api/admin/users/reset-password", Some(&admin), json!({ "id": ana_id })).await;
+    let second_temporary = reset.body["temporary_password"].as_str().unwrap().to_string();
+    assert_ne!(second_temporary, temporary);
+    assert_eq!(server.login("ana", &temporary).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(server.login("ana", &second_temporary).await.body["must_change_password"], true);
+
+    let deleted = server.post("/api/admin/users/delete", Some(&admin), json!({ "id": ana_id })).await;
+    assert_eq!(deleted.status, StatusCode::OK);
+    assert_eq!(server.login("ana", &second_temporary).await.status, StatusCode::UNAUTHORIZED);
+    let missing = server.post("/api/admin/users/delete", Some(&admin), json!({ "id": ana_id })).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn administrators_cannot_lock_themselves_out() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await;
+    let admin_id = admin.body["user"]["id"].as_str().unwrap().to_string();
+    let cookie = admin.cookie.unwrap();
+
+    for (path, body) in [
+        ("set-active", json!({ "id": admin_id, "active": false })),
+        ("reset-password", json!({ "id": admin_id })),
+        ("delete", json!({ "id": admin_id })),
+        ("update", json!({ "id": admin_id, "role": "user" })),
+    ] {
+        let reply = server.post(&format!("/api/admin/users/{path}"), Some(&cookie), body).await;
+        assert_eq!(
+            (reply.status, reply.body["error"].clone()),
+            (StatusCode::CONFLICT, json!("self_modification_not_allowed")),
+            "{path}"
+        );
+    }
+    let renamed = server
+        .post(
+            "/api/admin/users/update",
+            Some(&cookie),
+            json!({ "id": admin_id, "display_name": "Root", "role": "admin" }),
+        )
+        .await;
+    assert_eq!(renamed.body["display_name"], "Root");
 }

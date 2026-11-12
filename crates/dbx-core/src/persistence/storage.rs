@@ -5,7 +5,7 @@ pub use dbx_drivers::runtime_config::{
 
 mod type_execution_receipts;
 mod web_users;
-pub use web_users::{NewWebUser, WebSession, WebUser, USERNAME_TAKEN, USER_NOT_FOUND};
+pub use web_users::{NewWebUser, WebSession, WebUser, LAST_ADMIN, USERNAME_TAKEN, USER_NOT_FOUND};
 pub use type_execution_receipts::{TypeExecutionBinding, TypeRecoveryContext};
 
 use std::collections::{HashMap, HashSet};

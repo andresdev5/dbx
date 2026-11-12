@@ -6,13 +6,14 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use dbx_authz::PlatformRole;
+use dbx_authz::{PlatformRole, Principal};
 use dbx_core::storage::USERNAME_TAKEN;
 use serde::{Deserialize, Serialize};
 
 use crate::captcha::CAPTCHA_TTL;
 use crate::identity::{burn_verification, check_new_password, hash_password, normalize_username, verify_password};
 use crate::request_context::{is_cross_site, ClientInfo};
+use crate::route_policy::{self, RouteClass};
 use crate::sessions::{hash_token, now_millis, SessionUser};
 use crate::state::{LoginThrottle, WebState};
 
@@ -21,6 +22,8 @@ pub const SETUP_REQUIRED: &str = "setup_required";
 pub const PASSWORD_CHANGE_REQUIRED: &str = "password_change_required";
 pub const INVALID_CREDENTIALS: &str = "invalid_credentials";
 pub const CROSS_SITE_REQUEST: &str = "cross_site_request";
+pub const ROUTE_NOT_CLASSIFIED: &str = "route_not_classified";
+pub const ADMIN_REQUIRED: &str = "admin_required";
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -91,7 +94,7 @@ pub struct AuthCheckResponse {
     pub user: Option<AuthUserView>,
 }
 
-fn error_response(status: StatusCode, code: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, code: &str) -> Response {
     (status, [("cache-control", "no-store")], Json(serde_json::json!({ "error": code }))).into_response()
 }
 
@@ -169,7 +172,7 @@ async fn forget_live_session(state: &WebState, token: &str) {
     }
 }
 
-async fn forget_live_sessions_by_hash(state: &WebState, token_hashes: &[String]) {
+pub(crate) async fn forget_live_sessions_by_hash(state: &WebState, token_hashes: &[String]) {
     if token_hashes.is_empty() {
         return;
     }
@@ -453,10 +456,6 @@ pub async fn logout(State(state): State<Arc<WebState>>, headers: HeaderMap) -> R
     (StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
-fn is_bootstrap_route(suffix: &str) -> bool {
-    matches!(suffix, "auth/login" | "auth/setup" | "auth/check" | "auth/captcha")
-}
-
 fn allowed_while_password_change_required(suffix: &str) -> bool {
     matches!(suffix, "auth/change-password" | "auth/logout")
 }
@@ -474,7 +473,17 @@ pub async fn auth_middleware(
         return error_response(StatusCode::FORBIDDEN, CROSS_SITE_REQUEST);
     }
 
-    if is_bootstrap_route(&suffix) || state.password_disabled {
+    let Some(route_class) = route_policy::classify(req.method(), &suffix) else {
+        log::warn!("Rejected {} /api/{suffix}: the route has no access policy", req.method());
+        return error_response(StatusCode::FORBIDDEN, ROUTE_NOT_CLASSIFIED);
+    };
+
+    if route_class == RouteClass::Public {
+        return next.run(req).await;
+    }
+
+    if state.password_disabled {
+        req.extensions_mut().insert(Principal::Local);
         return next.run(req).await;
     }
 
@@ -492,13 +501,32 @@ pub async fn auth_middleware(
     if user.must_change_password && !allowed_while_password_change_required(&suffix) {
         return error_response(StatusCode::FORBIDDEN, PASSWORD_CHANGE_REQUIRED);
     }
+    if route_class == RouteClass::Admin && user.role != PlatformRole::Admin {
+        return error_response(StatusCode::FORBIDDEN, ADMIN_REQUIRED);
+    }
 
     if !state.sessions.read().await.contains(&token) {
         state.sessions.write().await.insert(token.clone());
     }
+    req.extensions_mut().insert(Principal::User { user_id: user.user_id.clone(), groups: Vec::new(), role: user.role });
     req.extensions_mut().insert(user);
     let owner = token;
     dbx_core::session_credentials::with_credential_owner(Some(owner), async move { next.run(req).await }).await
+}
+
+pub struct CurrentUser(pub SessionUser);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for CurrentUser {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<SessionUser>()
+            .cloned()
+            .map(CurrentUser)
+            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, SESSION_EXPIRED))
+    }
 }
 
 #[cfg(test)]

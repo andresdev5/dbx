@@ -204,6 +204,13 @@ const patterns: [RegExp, string][] = [
   [/^session_expired$/, "auth.sessionExpired"],
   [/^password_change_required$/, "auth.passwordChangeRequired"],
   [/^cross_site_request$/, "auth.crossSiteRequest"],
+  [/^admin_required$/, "auth.adminRequired"],
+  [/^route_not_classified$/, "auth.routeNotClassified"],
+  [/^last_admin$/, "auth.lastAdmin"],
+  [/^username_taken$/, "auth.usernameTaken"],
+  [/^self_modification_not_allowed$/, "auth.selfModificationNotAllowed"],
+  [/^user_not_found$/, "auth.userNotFound"],
+  [/^display_name_invalid$/, "auth.displayNameInvalid"],
 
   // Dameng native dexp/dimp dump (crates/dbx-core/src/data/dameng_dump.rs)
   [/^\[damengToolNotFound\]/, "damengDump.errors.toolNotFound"],

@@ -228,6 +228,19 @@ mod tests {
         let admin = storage.find_web_user_by_username("admin").await.unwrap().unwrap();
         assert!(verify_password("first-pass", &admin.password_hash));
 
+        storage
+            .create_web_user(
+                NewWebUser {
+                    username: "backup".into(),
+                    display_name: None,
+                    password_hash: "hash".into(),
+                    role: PlatformRole::Admin,
+                    must_change_password: false,
+                },
+                2,
+            )
+            .await
+            .unwrap();
         storage.set_web_user_active(&admin.id, false, 2).await.unwrap();
         let outcome = bootstrap_users(&storage, &env(Some("second-pass"), None, true), 3).await.unwrap();
         assert_eq!(outcome, BootstrapOutcome::ResetFromEnv);

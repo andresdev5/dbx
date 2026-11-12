@@ -6,6 +6,7 @@ mod demo;
 mod error;
 mod identity;
 mod request_context;
+mod route_policy;
 mod routes;
 mod sessions;
 mod sse;
@@ -706,6 +707,12 @@ async fn serve() -> Result<(), String> {
         .route("/auth/setup", post(auth::setup).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)))
         .route("/auth/change-password", post(auth::change_password).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)))
         .route("/auth/logout", post(auth::logout))
+        .route("/admin/users/list", post(routes::admin_users::list))
+        .route("/admin/users/create", post(routes::admin_users::create))
+        .route("/admin/users/update", post(routes::admin_users::update))
+        .route("/admin/users/set-active", post(routes::admin_users::set_active))
+        .route("/admin/users/reset-password", post(routes::admin_users::reset_password))
+        .route("/admin/users/delete", post(routes::admin_users::delete))
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))

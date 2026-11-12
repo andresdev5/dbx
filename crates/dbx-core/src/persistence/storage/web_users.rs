@@ -6,6 +6,7 @@ use super::{params, OptionalExtension, Storage};
 
 pub const USERNAME_TAKEN: &str = "USERNAME_TAKEN";
 pub const USER_NOT_FOUND: &str = "USER_NOT_FOUND";
+pub const LAST_ADMIN: &str = "LAST_ADMIN";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebUser {
@@ -117,6 +118,29 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<WebSession> {
 
 fn sql_error(error: rusqlite::Error) -> String {
     error.to_string()
+}
+
+fn ensure_not_last_active_admin(conn: &rusqlite::Connection, id: &str) -> Result<(), String> {
+    let is_active_admin: Option<bool> = conn
+        .query_row(
+            "SELECT platform_role = 'admin' AND status = 'active' FROM users WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if is_active_admin != Some(true) {
+        return Ok(());
+    }
+    let active_admins: i64 = conn
+        .query_row("SELECT COUNT(*) FROM users WHERE platform_role = 'admin' AND status = 'active'", [], |row| {
+            row.get(0)
+        })
+        .map_err(sql_error)?;
+    if active_admins <= 1 {
+        return Err(LAST_ADMIN.to_string());
+    }
+    Ok(())
 }
 
 impl Storage {
@@ -232,13 +256,74 @@ impl Storage {
         let id = id.to_string();
         let status = if active { "active" } else { "disabled" };
         self.with_conn(move |conn| {
-            let changed = conn
+            let transaction = conn.transaction().map_err(sql_error)?;
+            if !active {
+                ensure_not_last_active_admin(&transaction, &id)?;
+            }
+            let changed = transaction
                 .execute("UPDATE users SET status = ?2, updated_at = ?3 WHERE id = ?1", params![id, status, now])
                 .map_err(sql_error)?;
             if changed == 0 {
                 return Err(USER_NOT_FOUND.to_string());
             }
-            Ok(())
+            transaction.commit().map_err(sql_error)
+        })
+        .await
+    }
+
+    pub async fn list_web_users(&self) -> Result<Vec<WebUser>, String> {
+        self.with_conn(|conn| {
+            let mut statement = conn
+                .prepare(&format!("SELECT {USER_COLUMNS} FROM users ORDER BY username COLLATE NOCASE"))
+                .map_err(sql_error)?;
+            let users = statement
+                .query_map([], user_from_row)
+                .map_err(sql_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql_error);
+            users
+        })
+        .await
+    }
+
+    pub async fn update_web_user_profile(
+        &self,
+        id: &str,
+        display_name: Option<String>,
+        role: PlatformRole,
+        now: i64,
+    ) -> Result<(), String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let transaction = conn.transaction().map_err(sql_error)?;
+            if role != PlatformRole::Admin {
+                ensure_not_last_active_admin(&transaction, &id)?;
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE users SET display_name = ?2, platform_role = ?3, updated_at = ?4 WHERE id = ?1",
+                    params![id, display_name, role.as_str(), now],
+                )
+                .map_err(sql_error)?;
+            if changed == 0 {
+                return Err(USER_NOT_FOUND.to_string());
+            }
+            transaction.commit().map_err(sql_error)
+        })
+        .await
+    }
+
+    pub async fn delete_web_user(&self, id: &str) -> Result<(), String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let transaction = conn.transaction().map_err(sql_error)?;
+            ensure_not_last_active_admin(&transaction, &id)?;
+            transaction.execute("DELETE FROM user_sessions WHERE user_id = ?1", params![id]).map_err(sql_error)?;
+            let changed = transaction.execute("DELETE FROM users WHERE id = ?1", params![id]).map_err(sql_error)?;
+            if changed == 0 {
+                return Err(USER_NOT_FOUND.to_string());
+            }
+            transaction.commit().map_err(sql_error)
         })
         .await
     }
@@ -432,6 +517,40 @@ mod tests {
         assert_eq!(updated.updated_at, 30);
         assert_eq!(storage.set_web_user_password("missing", "h", false, 1).await.unwrap_err(), USER_NOT_FOUND);
         assert_eq!(storage.count_active_web_admins().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_last_active_admin_cannot_be_removed_demoted_or_disabled() {
+        let (_directory, storage) = storage().await;
+        let first = storage.create_web_user(new_user("first", PlatformRole::Admin), 1).await.unwrap();
+        let ana = storage.create_web_user(new_user("ana", PlatformRole::User), 1).await.unwrap();
+        assert_eq!(storage.set_web_user_active(&first.id, false, 2).await.unwrap_err(), LAST_ADMIN);
+        assert_eq!(
+            storage.update_web_user_profile(&first.id, None, PlatformRole::User, 2).await.unwrap_err(),
+            LAST_ADMIN
+        );
+        assert_eq!(storage.delete_web_user(&first.id).await.unwrap_err(), LAST_ADMIN);
+
+        storage.update_web_user_profile(&ana.id, Some("Ana".into()), PlatformRole::Admin, 3).await.unwrap();
+        storage.set_web_user_active(&first.id, false, 4).await.unwrap();
+        assert_eq!(storage.delete_web_user(&ana.id).await.unwrap_err(), LAST_ADMIN);
+        storage.delete_web_user(&first.id).await.unwrap();
+        assert_eq!(storage.delete_web_user(&first.id).await.unwrap_err(), USER_NOT_FOUND);
+
+        let users = storage.list_web_users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].display_name.as_deref(), Some("Ana"));
+        assert_eq!(users[0].role, PlatformRole::Admin);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_removes_its_sessions() {
+        let (_directory, storage) = storage().await;
+        storage.create_web_user(new_user("admin", PlatformRole::Admin), 1).await.unwrap();
+        let ana = storage.create_web_user(new_user("ana", PlatformRole::User), 1).await.unwrap();
+        storage.insert_web_session(session("s1", &ana.id, 10)).await.unwrap();
+        storage.delete_web_user(&ana.id).await.unwrap();
+        assert!(storage.find_web_session("s1").await.unwrap().is_none());
     }
 
     #[tokio::test]

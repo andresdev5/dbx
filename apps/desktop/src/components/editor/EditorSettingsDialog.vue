@@ -354,6 +354,7 @@ import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import AppLogo from "@/components/icons/AppLogo.vue";
 import ChangelogPanel from "@/components/settings/ChangelogPanel.vue";
 import WebLoginCaptchaSetting from "@/components/settings/WebLoginCaptchaSetting.vue";
+import UserManagementPanel from "@/components/auth/UserManagementPanel.vue";
 import SettingsTransferPanel from "@/components/settings/SettingsTransferPanel.vue";
 import McpCapabilityBrowser from "@/components/settings/McpCapabilityBrowser.vue";
 import McpPluginToolsModeSetting from "@/components/settings/McpPluginToolsModeSetting.vue";
@@ -14016,7 +14017,11 @@ LIMIT 100;</pre>
                 </p>
               </div>
 
-              <div class="border-t border-border/60 pt-5 space-y-3">
+              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
+                <UserManagementPanel :current-user-id="signedInUser.id" />
+              </div>
+
+              <div v-if="!signedInUser || signedInUser.role === 'admin'" class="border-t border-border/60 pt-5 space-y-3">
                 <WebLoginCaptchaSetting />
               </div>
 

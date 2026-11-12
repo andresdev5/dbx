@@ -1,3 +1,4 @@
+pub mod admin_users;
 pub mod agents;
 pub mod ai;
 pub mod app_settings;
