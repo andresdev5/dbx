@@ -493,6 +493,7 @@ pub struct AppState {
     /// In-memory, never-persisted 1/5 minute write overrides for read-only connections.
     pub write_unlock_windows: crate::write_unlock::WriteUnlockWindows,
     pub authz: crate::authz::AuthzRuntime,
+    pub audit: crate::audit::AuditLog,
     pub native_jobs: crate::schema::native_jobs::NativeJobRegistry,
     metadata_gates: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     /// Backend-confirmed liveness losses plus resync requests (#4339). The keepalive task
@@ -2129,6 +2130,7 @@ impl AppState {
             session_credentials: SessionCredentialStore::new(),
             write_unlock_windows: crate::write_unlock::WriteUnlockWindows::default(),
             authz: crate::authz::AuthzRuntime::default(),
+            audit: crate::audit::AuditLog::default(),
             native_jobs: crate::schema::native_jobs::NativeJobRegistry::default(),
             metadata_gates: Arc::new(Mutex::new(HashMap::new())),
             // Bounded so a shell that stops draining cannot grow memory without bound. A

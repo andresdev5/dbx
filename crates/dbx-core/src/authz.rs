@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::audit::AuditEvent;
 use crate::sql_operations::{classify_sql_operations, ResolveContext};
-use dbx_authz::{compile, ConnectionContext, Decision, EffectivePermissions, Need, Operations, Principal, Resource};
+use dbx_authz::{
+    compile, ConnectionContext, Decision, EffectivePermissions, Need, Operations, Principal, Requirement, Resource,
+};
 
 use crate::connection::session_credentials::current_credential_owner;
 use crate::connection::AppState;
@@ -11,6 +14,53 @@ use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::persistence::storage::{AuthzSnapshot, Storage};
 
 pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied:";
+
+const QUIET_READS: Operations = Operations::SELECT;
+
+fn audit_decision(
+    state: &AppState,
+    principal: &Principal,
+    event: &str,
+    requirement: &Requirement,
+    decision: &Decision,
+    statement: Option<&str>,
+) {
+    if !state.audit.is_enabled() {
+        return;
+    }
+    let operations = requirement.operations();
+    if statement.is_none() && decision.is_allowed() && operations.difference(QUIET_READS).is_empty() {
+        return;
+    }
+    let mut record = AuditEvent::new(event).by(principal).operations(operations);
+    record = match decision {
+        Decision::Allow => {
+            let mut tables: Vec<String> = Vec::new();
+            for need in &requirement.needs {
+                if let Some(table) = &need.resource.table {
+                    if !tables.contains(table) {
+                        tables.push(table.clone());
+                    }
+                }
+            }
+            match requirement.needs.first() {
+                Some(need) => {
+                    let mut resource = need.resource.clone();
+                    resource.table = None;
+                    record.resource(&resource).tables(tables).allowed()
+                }
+                None => record.allowed(),
+            }
+        }
+        Decision::Deny(denial) => {
+            record.resource(&denial.resource).denied(denial_message(decision).unwrap_or_default())
+        }
+    };
+    if let Some(statement) = statement {
+        record = record.statement(statement);
+    }
+    state.audit.record_in_request(record);
+}
 
 #[derive(Default)]
 pub struct AuthzRuntime {
@@ -75,23 +125,116 @@ fn schema_aware(database_type: DatabaseType) -> bool {
 }
 
 pub const STANDARD_FUNCTIONS: &[&str] = &[
-    "abs", "array_agg", "avg", "bit_length", "btrim", "ceil", "ceiling", "char_length", "character_length", "coalesce",
-    "concat", "concat_ws", "count", "cume_dist", "current_date", "current_time", "current_timestamp", "date",
-    "date_part", "date_trunc", "dateadd", "datediff", "datepart", "day", "dense_rank", "exp", "first_value", "floor",
-    "format", "greatest", "group_concat", "hour", "if", "ifnull", "iif", "initcap", "instr", "isnull", "json_agg",
-    "json_build_object", "json_extract", "json_object", "jsonb_agg", "jsonb_build_object", "lag", "last_value", "lead",
-    "least", "left", "len", "length", "ln", "localtime", "localtimestamp", "log", "log10", "lower", "lpad", "ltrim",
-    "max", "md5", "min", "minute", "mod", "month", "now", "nth_value", "ntile", "nullif", "nvl", "octet_length",
-    "percent_rank", "position", "power", "quarter", "rank", "regexp_replace", "repeat", "replace", "reverse", "right",
-    "round", "row_number", "rpad", "rtrim", "second", "sign", "split_part", "sqrt", "stddev", "string_agg", "strpos",
-    "substr", "substring", "sum", "to_char", "to_date", "to_number", "to_timestamp", "trim", "trunc", "upper",
-    "variance", "week", "year",
+    "abs",
+    "array_agg",
+    "avg",
+    "bit_length",
+    "btrim",
+    "ceil",
+    "ceiling",
+    "char_length",
+    "character_length",
+    "coalesce",
+    "concat",
+    "concat_ws",
+    "count",
+    "cume_dist",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "date",
+    "date_part",
+    "date_trunc",
+    "dateadd",
+    "datediff",
+    "datepart",
+    "day",
+    "dense_rank",
+    "exp",
+    "first_value",
+    "floor",
+    "format",
+    "greatest",
+    "group_concat",
+    "hour",
+    "if",
+    "ifnull",
+    "iif",
+    "initcap",
+    "instr",
+    "isnull",
+    "json_agg",
+    "json_build_object",
+    "json_extract",
+    "json_object",
+    "jsonb_agg",
+    "jsonb_build_object",
+    "lag",
+    "last_value",
+    "lead",
+    "least",
+    "left",
+    "len",
+    "length",
+    "ln",
+    "localtime",
+    "localtimestamp",
+    "log",
+    "log10",
+    "lower",
+    "lpad",
+    "ltrim",
+    "max",
+    "md5",
+    "min",
+    "minute",
+    "mod",
+    "month",
+    "now",
+    "nth_value",
+    "ntile",
+    "nullif",
+    "nvl",
+    "octet_length",
+    "percent_rank",
+    "position",
+    "power",
+    "quarter",
+    "rank",
+    "regexp_replace",
+    "repeat",
+    "replace",
+    "reverse",
+    "right",
+    "round",
+    "row_number",
+    "rpad",
+    "rtrim",
+    "second",
+    "sign",
+    "split_part",
+    "sqrt",
+    "stddev",
+    "string_agg",
+    "strpos",
+    "substr",
+    "substring",
+    "sum",
+    "to_char",
+    "to_date",
+    "to_number",
+    "to_timestamp",
+    "trim",
+    "trunc",
+    "upper",
+    "variance",
+    "week",
+    "year",
 ];
 
 fn function_requires_execute(function: &str, allowlist: &[String]) -> bool {
     let short = function.rsplit('.').next().unwrap_or(function);
-    !(STANDARD_FUNCTIONS.contains(&short)
-        || allowlist.iter().any(|allowed| allowed == function || allowed == short))
+    !(STANDARD_FUNCTIONS.contains(&short) || allowlist.iter().any(|allowed| allowed == function || allowed == short))
 }
 
 pub fn denial_message(decision: &Decision) -> Option<String> {
@@ -235,7 +378,13 @@ pub async fn authorize_connection_access(state: &AppState, connection_id: &str) 
     if principal_permissions(state, &principal, &config).await.is_visible() {
         Ok(())
     } else {
-        Err(format!("{PERMISSION_DENIED_PREFIX} no access to connection {}", config.name))
+        let message = format!("{PERMISSION_DENIED_PREFIX} no access to connection {}", config.name);
+        if state.audit.is_enabled() {
+            state.audit.record_in_request(
+                AuditEvent::new("connection_denied").by(&principal).connection(&config.id).denied(message.clone()),
+            );
+        }
+        Err(message)
     }
 }
 
@@ -253,8 +402,9 @@ pub async fn authorize_connection_operations(
         return Err(format!("{PERMISSION_DENIED_PREFIX} unknown connection"));
     };
     let permissions = principal_permissions(state, &principal, &config).await;
-    let decision = permissions
-        .authorize(&dbx_authz::Requirement::single(Need::within(Resource::connection(config.id.clone()), operations)));
+    let requirement = Requirement::single(Need::within(Resource::connection(config.id.clone()), operations));
+    let decision = permissions.authorize(&requirement);
+    audit_decision(state, &principal, "data_access", &requirement, &decision, None);
     match denial_message(&decision) {
         Some(message) => Err(message),
         None => Ok(()),
@@ -302,7 +452,10 @@ pub async fn authorize_resource(
     }
     let need = if within { Need::within(resource, operations) } else { Need::exact(resource, operations) };
     let permissions = principal_permissions(state, &principal, &config).await;
-    match denial_message(&permissions.authorize(&dbx_authz::Requirement::single(need))) {
+    let requirement = Requirement::single(need);
+    let decision = permissions.authorize(&requirement);
+    audit_decision(state, &principal, "data_access", &requirement, &decision, None);
+    match denial_message(&decision) {
         Some(message) => Err(message),
         None => Ok(()),
     }
@@ -353,7 +506,9 @@ async fn authorize_statements(
                 requirement.push(Need::within(resource, Operations::EXECUTE));
             }
         }
-        if let Some(message) = denial_message(&permissions.authorize(&requirement)) {
+        let decision = permissions.authorize(&requirement);
+        audit_decision(state, principal, "sql", &requirement, &decision, Some(sql));
+        if let Some(message) = denial_message(&decision) {
             return Err(message);
         }
     }
@@ -510,6 +665,100 @@ mod tests {
         assert!(run_as(&state, "ana-token", "ALTER TABLE orders ADD COLUMN x INT").await.is_err());
     }
 
+    async fn audit_rows(state: &AppState, expected: usize) -> Vec<crate::persistence::storage::AuditEntry> {
+        for _ in 0..200 {
+            let rows = state
+                .storage
+                .list_audit_events(crate::persistence::storage::AuditFilter { limit: 100, ..Default::default() })
+                .await
+                .unwrap();
+            if rows.len() >= expected {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("audit events were not written");
+    }
+
+    #[tokio::test]
+    async fn audits_each_statement_with_its_decision_and_session() {
+        let (_root, state) = state(false).await;
+        state.audit.start(state.storage.clone(), None);
+        enforce(
+            &state,
+            vec![grant(
+                "r",
+                Subject::User("ana".into()),
+                Scope::Resource(Resource::connection(CONNECTION)),
+                Effect::Allow,
+                BuiltinRole::Reader.operations(),
+            )],
+            &[],
+        );
+        state.audit.remember_client("ana-token", Some("10.0.0.7"));
+        run_as(&state, "ana-token", "SELECT * FROM orders").await.unwrap();
+        run_as(&state, "ana-token", "DELETE FROM orders WHERE status = 'void'").await.unwrap_err();
+        run_as(&state, "bob-token", "SELECT 1").await.unwrap_err();
+
+        let rows = audit_rows(&state, 3).await;
+        let sql: Vec<_> = rows.iter().filter(|row| row.event == "sql").collect();
+        assert_eq!(sql.len(), 2, "{rows:?}");
+        let denied = sql.iter().find(|row| row.decision.as_deref() == Some("deny")).unwrap();
+        assert_eq!(denied.user_id.as_deref(), Some("ana"));
+        assert_eq!(denied.operations, Some(Operations::DELETE));
+        assert_eq!(denied.database_name.as_deref(), Some("main"));
+        assert_eq!(denied.table_names.as_deref(), Some("orders"));
+        assert_eq!(denied.ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(denied.session_ref.as_deref(), Some(crate::audit::session_ref("ana-token").as_str()));
+        assert!(denied.reason.as_deref().is_some_and(|reason| reason.contains("DELETE required")));
+        assert_eq!(
+            state.storage.reveal_audit_statement(&denied.event_id).await.unwrap().as_deref(),
+            Some("DELETE FROM orders WHERE status = 'void'")
+        );
+        let allowed = sql.iter().find(|row| row.decision.as_deref() == Some("allow")).unwrap();
+        assert_eq!(allowed.operations, Some(Operations::SELECT));
+        assert_eq!(allowed.table_names.as_deref(), Some("orders"));
+        let connection = rows.iter().find(|row| row.event == "connection_denied").unwrap();
+        assert_eq!(connection.user_id.as_deref(), Some("bob"));
+        assert_eq!(connection.connection_id.as_deref(), Some(CONNECTION));
+    }
+
+    #[tokio::test]
+    async fn quiet_reads_outside_sql_are_not_audited() {
+        let (_root, state) = state(false).await;
+        state.audit.start(state.storage.clone(), None);
+        enforce(
+            &state,
+            vec![grant(
+                "r",
+                Subject::User("ana".into()),
+                Scope::Resource(Resource::connection(CONNECTION)),
+                Effect::Allow,
+                BuiltinRole::Analyst.operations(),
+            )],
+            &[],
+        );
+        with_credential_owner(Some("ana-token".into()), async {
+            authorize_resource(&state, CONNECTION, Some("main"), None, None, Operations::SELECT, true).await.unwrap();
+            authorize_resource(&state, CONNECTION, Some("main"), None, None, Operations::EXPORT, true).await.unwrap();
+            authorize_resource(&state, CONNECTION, Some("main"), None, Some("orders"), Operations::DELETE, false)
+                .await
+                .unwrap_err();
+        })
+        .await;
+        audit_rows(&state, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let rows = audit_rows(&state, 2).await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|row| row.event == "data_access"));
+        assert!(rows
+            .iter()
+            .any(|row| row.operations == Some(Operations::EXPORT) && row.decision.as_deref() == Some("allow")));
+        assert!(rows
+            .iter()
+            .any(|row| row.operations == Some(Operations::DELETE) && row.decision.as_deref() == Some("deny")));
+    }
+
     #[tokio::test]
     async fn users_without_grants_cannot_even_open_the_connection() {
         let (_root, state) = state(false).await;
@@ -554,7 +803,8 @@ mod tests {
     }
 
     async fn check_as_ana(state: &AppState, sql: &str) -> Result<(), String> {
-        with_credential_owner(Some("ana-token".into()), authorize_sql_for(state, CONNECTION, Some("main"), &[sql])).await
+        with_credential_owner(Some("ana-token".into()), authorize_sql_for(state, CONNECTION, Some("main"), &[sql]))
+            .await
     }
 
     #[tokio::test]

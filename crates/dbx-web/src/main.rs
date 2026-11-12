@@ -1,3 +1,4 @@
+mod audit_events;
 mod auth;
 mod bootstrap;
 mod captcha;
@@ -623,6 +624,12 @@ async fn serve() -> Result<(), String> {
         if let Err(error) = app_state.authz.reload(&app_state.storage).await {
             log::error!("Failed to load DBX Web permissions; only administrators keep access: {error}");
         }
+        let retention = dbx_core::audit::retention_days_from(std::env::var("DBX_AUDIT_RETENTION_DAYS").ok().as_deref());
+        app_state.audit.start(app_state.storage.clone(), retention);
+        match retention {
+            Some(days) => log::info!("DBX Web audit log enabled; events are kept for {days} days"),
+            None => log::info!("DBX Web audit log enabled; events are kept indefinitely"),
+        }
     }
 
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
@@ -740,6 +747,11 @@ async fn serve() -> Result<(), String> {
         .route("/admin/grants/effective", post(routes::admin_access::effective))
         .route("/admin/connection-policies/list", post(routes::admin_access::list_connection_policies))
         .route("/admin/connection-policies/save", post(routes::admin_access::save_connection_policy))
+        .route("/admin/audit/list", post(routes::admin_audit::list))
+        .route("/admin/audit/reveal", post(routes::admin_audit::reveal))
+        .route("/admin/audit/export", post(routes::admin_audit::export))
+        .route("/admin/sessions/list", post(routes::admin_audit::list_sessions))
+        .route("/admin/sessions/revoke", post(routes::admin_audit::revoke_session))
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))

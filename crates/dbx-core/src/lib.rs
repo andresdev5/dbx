@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod ai;
+pub mod audit;
 pub mod authz;
 pub mod cc_switch;
 pub mod data;

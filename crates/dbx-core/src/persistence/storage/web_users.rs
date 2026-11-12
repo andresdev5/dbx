@@ -441,6 +441,24 @@ impl Storage {
         .await
     }
 
+    pub async fn list_live_web_sessions(&self, idle_cutoff: i64, now: i64) -> Result<Vec<WebSession>, String> {
+        self.with_conn(move |conn| {
+            let mut statement = conn
+                .prepare(&format!(
+                    "SELECT {SESSION_COLUMNS} FROM user_sessions WHERE revoked_at IS NULL AND last_seen_at >= ?1 \
+                     AND (expires_at IS NULL OR expires_at > ?2) ORDER BY last_seen_at DESC"
+                ))
+                .map_err(sql_error)?;
+            let sessions = statement
+                .query_map(params![idle_cutoff, now], session_from_row)
+                .map_err(sql_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql_error)?;
+            Ok(sessions)
+        })
+        .await
+    }
+
     pub async fn purge_web_sessions(&self, idle_cutoff: i64, now: i64) -> Result<usize, String> {
         self.with_conn(move |conn| {
             conn.execute(

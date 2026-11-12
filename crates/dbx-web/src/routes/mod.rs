@@ -1,4 +1,5 @@
 pub mod admin_access;
+pub mod admin_audit;
 pub mod admin_users;
 pub mod agents;
 pub mod ai;

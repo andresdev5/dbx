@@ -351,6 +351,17 @@ impl SecretCodec {
         Ok(format!("{PREFIX}.{}.{}", b64.encode(nonce), b64.encode(ciphertext)))
     }
 
+    pub fn keyed_digest(&self, label: &str, message: &str) -> String {
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+        let mut derive = <HmacSha256 as Mac>::new_from_slice(&self.key).expect("HMAC accepts any key length");
+        derive.update(format!("dbx-keyed-digest-v1\0{label}").as_bytes());
+        let subkey = derive.finalize().into_bytes();
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&subkey).expect("HMAC accepts any key length");
+        mac.update(message.as_bytes());
+        mac.finalize().into_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     pub fn decrypt(&self, namespace: &str, key: &str, envelope: &str) -> Result<String, String> {
         let mut parts = envelope.split('.');
         if parts.next() != Some(PREFIX) {

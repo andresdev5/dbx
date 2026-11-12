@@ -1,3 +1,4 @@
+use crate::audit_events::record_action;
 use crate::auth::MaybeUser;
 use crate::{error::AppError, state::WebState};
 use axum::{
@@ -56,7 +57,28 @@ pub async fn command(
             _ => {}
         }
     }
-    Ok(Json(service.command(command).await?))
+    let audit = match &command {
+        BackupCommand::Save { schedule } => Some((
+            "backup_schedule_saved",
+            serde_json::json!({
+                "schedule_id": schedule.id,
+                "connection_id": schedule.config.connection_id,
+                "owner_user_id": schedule.owner_user_id,
+            }),
+        )),
+        BackupCommand::SetOwner { id, owner_user_id } => {
+            Some(("backup_owner_changed", serde_json::json!({ "schedule_id": id, "owner_user_id": owner_user_id })))
+        }
+        BackupCommand::DeleteSchedule { id } => {
+            Some(("backup_schedule_deleted", serde_json::json!({ "schedule_id": id })))
+        }
+        _ => None,
+    };
+    let result = service.command(command).await?;
+    if let (Some((event, detail)), Some(user)) = (audit, &user) {
+        record_action(&state, user, event, detail);
+    }
+    Ok(Json(result))
 }
 
 const BACKUP_OPERATIONS: Operations = Operations::SELECT.union(Operations::EXPORT);

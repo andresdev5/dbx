@@ -202,6 +202,15 @@ impl SessionManager {
         storage.revoke_web_session(&token_hash, now).await
     }
 
+    pub async fn revoke_hash(&self, storage: &Storage, token_hash: &str, now: i64) -> Result<(), String> {
+        self.cache.write().await.remove(token_hash);
+        storage.revoke_web_session(token_hash, now).await
+    }
+
+    pub fn idle_cutoff(&self, now: i64) -> i64 {
+        now.saturating_sub(self.config.idle_ms())
+    }
+
     pub async fn revoke_user(
         &self,
         storage: &Storage,
@@ -220,7 +229,7 @@ impl SessionManager {
 
     pub async fn purge(&self, storage: &Storage, now: i64) -> Result<usize, String> {
         self.cache.write().await.retain(|_, entry| self.config.is_live(entry.last_seen_at, entry.expires_at, now));
-        storage.purge_web_sessions(now.saturating_sub(self.config.idle_ms()), now).await
+        storage.purge_web_sessions(self.idle_cutoff(now), now).await
     }
 }
 

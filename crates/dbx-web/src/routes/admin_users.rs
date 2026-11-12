@@ -9,6 +9,7 @@ use dbx_authz::PlatformRole;
 use dbx_core::storage::{NewWebUser, WebUser, LAST_ADMIN, USERNAME_TAKEN, USER_NOT_FOUND};
 use serde::{Deserialize, Serialize};
 
+use crate::audit_events::record_action;
 use crate::auth::{error_response, forget_live_sessions_by_hash, CurrentUser};
 use crate::identity::{check_new_password, hash_password, normalize_username};
 use crate::sessions::now_millis;
@@ -169,7 +170,7 @@ pub async fn list(State(state): State<Arc<WebState>>, _admin: CurrentUser) -> Ad
 
 pub async fn create(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<CreateUserRequest>,
 ) -> AdminResult {
     let username = normalize_username(&body.username).map_err(|code| AdminError::new(StatusCode::BAD_REQUEST, code))?;
@@ -187,6 +188,12 @@ pub async fn create(
         .await
         .map_err(AdminError::storage)?;
     log::info!("Created DBX Web user '{}' ({})", user.username, user.role.as_str());
+    record_action(
+        &state,
+        &admin.0,
+        "user_created",
+        serde_json::json!({ "user_id": user.id, "username": user.username, "role": user.role.as_str() }),
+    );
     Ok((StatusCode::CREATED, Json(PasswordIssued { user: user.into(), temporary_password })).into_response())
 }
 
@@ -206,7 +213,14 @@ pub async fn update(
         .await
         .map_err(AdminError::storage)?;
     state.session_manager.forget_user(&body.id).await;
-    Ok(Json(load_summary(&state, &body.id).await?).into_response())
+    let summary = load_summary(&state, &body.id).await?;
+    record_action(
+        &state,
+        &admin.0,
+        "user_updated",
+        serde_json::json!({ "user_id": body.id, "username": summary.username, "role": body.role.as_str() }),
+    );
+    Ok(Json(summary).into_response())
 }
 
 pub async fn set_active(
@@ -219,7 +233,14 @@ pub async fn set_active(
     if !body.active {
         end_all_sessions(&state, &body.id).await;
     }
-    Ok(Json(load_summary(&state, &body.id).await?).into_response())
+    let summary = load_summary(&state, &body.id).await?;
+    record_action(
+        &state,
+        &admin.0,
+        if body.active { "user_activated" } else { "user_deactivated" },
+        serde_json::json!({ "user_id": body.id, "username": summary.username }),
+    );
+    Ok(Json(summary).into_response())
 }
 
 pub async fn reset_password(
@@ -233,6 +254,12 @@ pub async fn reset_password(
     state.app.storage.set_web_user_password(&body.id, &hash, true, now_millis()).await.map_err(AdminError::storage)?;
     end_all_sessions(&state, &body.id).await;
     let user = load_summary(&state, &body.id).await?;
+    record_action(
+        &state,
+        &admin.0,
+        "user_password_reset",
+        serde_json::json!({ "user_id": body.id, "username": user.username }),
+    );
     Ok(Json(PasswordIssued { user, temporary_password }).into_response())
 }
 
@@ -242,8 +269,10 @@ pub async fn delete(
     Json(body): Json<UserIdRequest>,
 ) -> AdminResult {
     reject_self(&admin, &body.id)?;
+    let username = state.app.storage.find_web_user(&body.id).await.ok().flatten().map(|user| user.username);
     end_all_sessions(&state, &body.id).await;
     state.app.storage.delete_web_user(&body.id).await.map_err(AdminError::storage)?;
+    record_action(&state, &admin.0, "user_deleted", serde_json::json!({ "user_id": body.id, "username": username }));
     if let Err(error) = state.app.authz.reload(&state.app.storage).await {
         log::error!("Failed to reload DBX Web permissions after deleting a user: {error}");
     }

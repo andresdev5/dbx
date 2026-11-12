@@ -126,6 +126,11 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/admin/grants/effective", post(crate::routes::admin_access::effective))
         .route("/api/admin/connection-policies/list", post(crate::routes::admin_access::list_connection_policies))
         .route("/api/admin/connection-policies/save", post(crate::routes::admin_access::save_connection_policy))
+        .route("/api/admin/audit/list", post(crate::routes::admin_audit::list))
+        .route("/api/admin/audit/reveal", post(crate::routes::admin_audit::reveal))
+        .route("/api/admin/audit/export", post(crate::routes::admin_audit::export))
+        .route("/api/admin/sessions/list", post(crate::routes::admin_audit::list_sessions))
+        .route("/api/admin/sessions/revoke", post(crate::routes::admin_audit::revoke_session))
         .route("/api/connection/list", get(crate::routes::connection::load_connections))
         .route("/api/database-backups", post(crate::routes::scheduled_backup::command))
         .fallback(|| async { "handled" })
@@ -775,7 +780,6 @@ async fn existing_backups_are_migrated_to_system_access_once() {
     assert!(state.app.storage.list_grants().await.unwrap().is_empty(), "the migration runs only once");
 }
 
-
 #[tokio::test]
 async fn connection_policies_are_validated_and_listed() {
     let directory = tempfile::tempdir().unwrap();
@@ -787,7 +791,9 @@ async fn connection_policies_are_validated_and_listed() {
     let server = serve(state.clone()).await;
     let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
     let save = |body: Value| server.post("/api/admin/connection-policies/save", Some(&admin), body);
-    let invalid = save(json!({ "connection_id": "ventas", "strict_function_mode": true, "function_allowlist": ["drop table;"] })).await;
+    let invalid =
+        save(json!({ "connection_id": "ventas", "strict_function_mode": true, "function_allowlist": ["drop table;"] }))
+            .await;
     assert_eq!(invalid.body["error"], "function_allowlist_invalid");
     let unknown = save(json!({ "connection_id": "nope", "strict_function_mode": true })).await;
     assert_eq!(unknown.body["error"], "connection_not_found");
@@ -795,5 +801,223 @@ async fn connection_policies_are_validated_and_listed() {
     assert_eq!(saved.body["function_allowlist"], json!(["fmt", "sales.score"]));
     let listed = server.post("/api/admin/connection-policies/list", Some(&admin), json!({})).await;
     assert_eq!(listed.body[0]["strict_function_mode"], true);
-    assert_eq!(state.app.authz.snapshot().strict_functions.get("ventas"), Some(&vec!["fmt".to_string(), "sales.score".to_string()]));
+    assert_eq!(
+        state.app.authz.snapshot().strict_functions.get("ventas"),
+        Some(&vec!["fmt".to_string(), "sales.score".to_string()])
+    );
+}
+
+async fn audit_rows(state: &WebState, expected: usize) -> Vec<dbx_core::storage::AuditEntry> {
+    for _ in 0..300 {
+        let rows = state
+            .app
+            .storage
+            .list_audit_events(dbx_core::storage::AuditFilter { limit: 200, ..Default::default() })
+            .await
+            .unwrap();
+        if rows.len() >= expected {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("audit events were not written");
+}
+
+#[tokio::test]
+async fn sign_ins_and_administrative_changes_are_audited() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    state.app.authz.set_enforced(true);
+    state.app.audit.start(state.app.storage.clone(), None);
+    create_user(&state, "ana", "ana-password", false).await;
+    save_sqlite_connection(&state, "ventas", directory.path()).await;
+    let server = serve(state.clone()).await;
+
+    assert_eq!(server.login("ana", "wrong-password").await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(server.login("nobody", "wrong-password").await.status, StatusCode::UNAUTHORIZED);
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let ana = server.login("ana", "ana-password").await.cookie.unwrap();
+    let ana_id = state.app.storage.find_web_user_by_username("ana").await.unwrap().unwrap().id;
+    server.get("/api/connection/list", Some(&admin)).await;
+    let saved = server
+        .post(
+            "/api/admin/grants/save",
+            Some(&admin),
+            json!({
+                "subject": { "kind": "user", "id": ana_id },
+                "scope": { "kind": "resource", "value": { "connectionId": "ventas" } },
+                "effect": "deny",
+                "operations": ["DELETE"]
+            }),
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+    server.post("/api/admin/users/create", Some(&admin), json!({ "username": "bob", "role": "user" })).await;
+    let changed = server
+        .post(
+            "/api/auth/change-password",
+            Some(&ana),
+            json!({ "old_password": "ana-password", "new_password": "ana-password-2" }),
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::OK, "{:?}", changed.body);
+    assert_eq!(server.post("/api/auth/logout", Some(&ana), json!({})).await.status, StatusCode::OK);
+
+    let rows = audit_rows(&state, 8).await;
+    let find = |event: &str| rows.iter().filter(|row| row.event == event).collect::<Vec<_>>();
+    let failed = find("login_failed");
+    assert_eq!(failed.len(), 2, "{rows:?}");
+    assert!(failed.iter().all(|row| row.reason.as_deref() == Some("invalid_credentials")));
+    assert!(failed.iter().all(|row| row.ip.as_deref() == Some("127.0.0.1")));
+    assert!(failed.iter().any(|row| row.username.as_deref() == Some("nobody")));
+    let succeeded = find("login_succeeded");
+    assert_eq!(succeeded.len(), 2);
+    let admin_login = succeeded.iter().find(|row| row.username.as_deref() == Some("admin")).unwrap();
+    let admin_token = admin.split_once('=').unwrap().1;
+    assert_eq!(admin_login.session_ref.as_deref(), Some(&crate::sessions::hash_token(admin_token)[..16]));
+
+    let grant = find("grant_saved");
+    assert_eq!(grant.len(), 1);
+    assert_eq!(grant[0].username.as_deref(), Some("admin"));
+    assert_eq!(grant[0].ip.as_deref(), Some("127.0.0.1"));
+    let detail: Value = serde_json::from_str(grant[0].detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["effect"], "deny");
+    assert_eq!(detail["operations"], json!(["DELETE"]));
+    let created = find("user_created");
+    let detail: Value = serde_json::from_str(created[0].detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["username"], "bob");
+    assert!(!created[0].detail.as_deref().unwrap().contains("temporary"));
+    assert_eq!(find("password_changed")[0].user_id.as_deref(), Some(ana_id.as_str()));
+    assert_eq!(find("logout")[0].username.as_deref(), Some("ana"));
+}
+
+fn audited_statement(user_id: &str, statement: &str, denied: bool) -> dbx_core::audit::AuditEvent {
+    let principal =
+        dbx_authz::Principal::User { user_id: user_id.into(), groups: Vec::new(), role: PlatformRole::User };
+    let event = dbx_core::audit::AuditEvent::new("sql")
+        .by(&principal)
+        .connection("ventas")
+        .operations(dbx_authz::Operations::UPDATE)
+        .statement(statement);
+    if denied {
+        event.denied("Permission denied: UPDATE required on crm")
+    } else {
+        event.allowed()
+    }
+}
+
+#[tokio::test]
+async fn administrators_search_reveal_and_export_the_audit_log() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    state.app.authz.set_enforced(true);
+    state.app.audit.start(state.app.storage.clone(), None);
+    create_user(&state, "ana", "ana-password", false).await;
+    let ana_id = state.app.storage.find_web_user_by_username("ana").await.unwrap().unwrap().id;
+    state
+        .app
+        .storage
+        .insert_audit_events(vec![
+            audited_statement(&ana_id, "UPDATE accounts SET plan = 'gold'", false),
+            audited_statement(&ana_id, "=HYPERLINK(\"x\")", true),
+        ])
+        .await
+        .unwrap();
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let ana = server.login("ana", "ana-password").await.cookie.unwrap();
+
+    assert_eq!(server.post("/api/admin/audit/list", Some(&ana), json!({})).await.status, StatusCode::FORBIDDEN);
+    let denied = server.post("/api/admin/audit/list", Some(&admin), json!({ "decision": "deny" })).await;
+    assert_eq!(denied.status, StatusCode::OK, "{:?}", denied.body);
+    let entries = denied.body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["username"], "ana");
+    assert_eq!(entries[0]["operations"], json!(["UPDATE"]));
+    assert_eq!(entries[0]["has_statement"], true);
+    assert!(entries[0].get("statement").is_none());
+
+    let found = server
+        .post("/api/admin/audit/list", Some(&admin), json!({ "statement": "UPDATE accounts SET plan = 'gold'" }))
+        .await;
+    let found = found.body["entries"].as_array().unwrap().clone();
+    assert_eq!(found.len(), 1);
+    let event_id = found[0]["event_id"].as_str().unwrap().to_string();
+    let page = server.post("/api/admin/audit/list", Some(&admin), json!({ "event": "sql", "limit": 1 })).await;
+    assert_eq!(page.body["entries"].as_array().unwrap().len(), 1);
+    let before = page.body["next_before_id"].as_i64().unwrap();
+    let rest = server
+        .post("/api/admin/audit/list", Some(&admin), json!({ "event": "sql", "limit": 1, "before_id": before }))
+        .await;
+    assert_ne!(rest.body["entries"][0]["id"], page.body["entries"][0]["id"]);
+    let invalid = server.post("/api/admin/audit/list", Some(&admin), json!({ "decision": "maybe" })).await;
+    assert_eq!(invalid.body["error"], "audit_filter_invalid");
+
+    let revealed = server.post("/api/admin/audit/reveal", Some(&admin), json!({ "event_id": event_id })).await;
+    assert_eq!(revealed.body["statement"], "UPDATE accounts SET plan = 'gold'");
+    let missing = server.post("/api/admin/audit/reveal", Some(&admin), json!({ "event_id": "nope" })).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+
+    let plain = server.post("/api/admin/audit/export", Some(&admin), json!({ "event": "sql" })).await;
+    let plain = plain.body.as_str().unwrap().to_string();
+    assert!(plain.starts_with("id,event_id,timestamp,"));
+    assert_eq!(plain.lines().count(), 3);
+    assert!(!plain.contains("gold"));
+    let full = server
+        .post("/api/admin/audit/export", Some(&admin), json!({ "event": "sql", "include_statements": true }))
+        .await;
+    let full = full.body.as_str().unwrap().to_string();
+    assert!(full.contains("UPDATE accounts SET plan = 'gold'"));
+    assert!(full.contains("\"'=HYPERLINK(\"\"x\"\")\""), "{full}");
+
+    let rows = audit_rows(&state, 6).await;
+    let revealed_events: Vec<_> = rows.iter().filter(|row| row.event == "audit_revealed").collect();
+    assert_eq!(revealed_events.len(), 1);
+    assert_eq!(revealed_events[0].username.as_deref(), Some("admin"));
+    let exports: Vec<_> = rows.iter().filter(|row| row.event == "audit_exported").collect();
+    assert_eq!(exports.len(), 2);
+    assert!(exports.iter().any(|row| row.detail.as_deref().unwrap().contains("\"include_statements\":true")));
+}
+
+#[tokio::test]
+async fn administrators_list_and_revoke_sessions() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    state.app.audit.start(state.app.storage.clone(), None);
+    create_user(&state, "ana", "ana-password", false).await;
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let ana_first = server.login("ana", "ana-password").await.cookie.unwrap();
+    let ana_second = server.login("ana", "ana-password").await.cookie.unwrap();
+    let ana_id = state.app.storage.find_web_user_by_username("ana").await.unwrap().unwrap().id;
+
+    let listed = server.post("/api/admin/sessions/list", Some(&admin), json!({})).await;
+    let sessions = listed.body.as_array().unwrap().clone();
+    assert_eq!(sessions.len(), 3);
+    let own = sessions.iter().find(|session| session["current"] == true).unwrap();
+    assert_eq!(own["username"], "admin");
+    assert_eq!(own["ip"], "127.0.0.1");
+    let own_id = own["id"].as_str().unwrap().to_string();
+    assert_eq!(own["session_ref"].as_str().unwrap(), &own_id[..16]);
+    let self_revoke = server.post("/api/admin/sessions/revoke", Some(&admin), json!({ "id": own_id })).await;
+    assert_eq!(self_revoke.body["error"], "self_modification_not_allowed");
+
+    let first_hash = crate::sessions::hash_token(ana_first.split_once('=').unwrap().1);
+    let revoked = server.post("/api/admin/sessions/revoke", Some(&admin), json!({ "id": first_hash })).await;
+    assert_eq!(revoked.body["revoked"], 1);
+    assert_eq!(server.get("/api/query/execute", Some(&ana_first)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(server.get("/api/query/execute", Some(&ana_second)).await.status, StatusCode::OK);
+    let again = server.post("/api/admin/sessions/revoke", Some(&admin), json!({ "id": first_hash })).await;
+    assert_eq!(again.status, StatusCode::NOT_FOUND);
+
+    let only_ana = server.post("/api/admin/sessions/list", Some(&admin), json!({ "user_id": ana_id })).await;
+    assert_eq!(only_ana.body.as_array().unwrap().len(), 1);
+    let all = server.post("/api/admin/sessions/revoke", Some(&admin), json!({ "user_id": ana_id })).await;
+    assert_eq!(all.body["revoked"], 1);
+    assert_eq!(server.get("/api/query/execute", Some(&ana_second)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(server.get("/api/query/execute", Some(&admin)).await.status, StatusCode::OK);
+
+    let rows = audit_rows(&state, 5).await;
+    assert!(rows.iter().any(|row| row.event == "session_revoked"));
+    assert!(rows.iter().any(|row| row.event == "user_sessions_revoked"));
 }

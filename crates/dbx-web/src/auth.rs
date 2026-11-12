@@ -7,12 +7,14 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use dbx_authz::{PlatformRole, Principal};
+use dbx_core::audit::AuditEvent;
 use dbx_core::storage::USERNAME_TAKEN;
 use serde::{Deserialize, Serialize};
 
+use crate::audit_events::by_session;
 use crate::captcha::CAPTCHA_TTL;
 use crate::identity::{burn_verification, check_new_password, hash_password, normalize_username, verify_password};
-use crate::request_context::{is_cross_site, ClientInfo};
+use crate::request_context::{client_info, is_cross_site, trust_proxy, ClientInfo};
 use crate::route_policy::{self, RouteClass};
 use crate::sessions::{hash_token, now_millis, SessionUser};
 use crate::state::{LoginThrottle, WebState};
@@ -158,8 +160,23 @@ pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+const MAX_AUDITED_USERNAME_CHARS: usize = 64;
+
+fn audit_auth_failure(state: &WebState, event: &str, username: &str, client: &ClientInfo, reason: &str) {
+    if !state.app.audit.is_enabled() {
+        return;
+    }
+    let username: String = username.trim().chars().take(MAX_AUDITED_USERNAME_CHARS).collect();
+    let mut record = AuditEvent::new(event).ip(client.ip_string().as_deref()).reason(reason);
+    if !username.is_empty() {
+        record = record.username(&username);
+    }
+    state.app.audit.record(record);
+}
+
 async fn forget_live_session(state: &WebState, token: &str) {
     state.app.authz.forget_owner(token);
+    state.app.audit.forget_client(token);
     let removed = {
         let mut sessions = state.sessions.write().await;
         let removed = sessions.remove(token);
@@ -184,7 +201,12 @@ pub(crate) async fn forget_live_sessions_by_hash(state: &WebState, token_hashes:
     }
 }
 
-async fn start_session(state: &WebState, user: &dbx_core::storage::WebUser, client: &ClientInfo) -> Response {
+async fn start_session(
+    state: &WebState,
+    user: &dbx_core::storage::WebUser,
+    client: &ClientInfo,
+    event: &str,
+) -> Response {
     let now = now_millis();
     let created = state
         .session_manager
@@ -201,6 +223,9 @@ async fn start_session(state: &WebState, user: &dbx_core::storage::WebUser, clie
         log::warn!("Failed to record the last login of '{}': {error}", user.username);
     }
     state.sessions.write().await.insert(token.clone());
+    state.app.audit.record(
+        AuditEvent::new(event).by_user(&user.id, &user.username).session(&token).ip(client.ip_string().as_deref()),
+    );
     let cookie = session_cookie(state, &token);
     let view = AuthUserView::from(&session_user);
     (
@@ -258,11 +283,13 @@ pub async fn login(State(state): State<Arc<WebState>>, client: ClientInfo, Json(
             .captchas
             .verify(body.captcha_id.as_deref().unwrap_or_default(), body.captcha_code.as_deref().unwrap_or_default());
         if !captcha_ok {
+            audit_auth_failure(&state, "login_failed", &body.username, &client, "captcha_invalid");
             return error_response(StatusCode::BAD_REQUEST, "captcha_invalid");
         }
     }
 
     if let Some(remaining) = locked_for {
+        audit_auth_failure(&state, "login_failed", &body.username, &client, "rate_limited");
         return rate_limited(remaining);
     }
 
@@ -286,6 +313,10 @@ pub async fn login(State(state): State<Arc<WebState>>, client: ClientInfo, Json(
         let now = std::time::Instant::now();
         throttle.record_failure(&ip_key, now);
         throttle.record_failure(&user_key, now);
+        drop(throttle);
+        let reason =
+            if user.as_ref().is_some_and(|user| !user.active) { "user_disabled" } else { "invalid_credentials" };
+        audit_auth_failure(&state, "login_failed", &body.username, &client, reason);
         return error_response(StatusCode::UNAUTHORIZED, INVALID_CREDENTIALS);
     }
     throttle.clear(&ip_key);
@@ -295,7 +326,7 @@ pub async fn login(State(state): State<Arc<WebState>>, client: ClientInfo, Json(
     let Some(user) = user else {
         return error_response(StatusCode::UNAUTHORIZED, INVALID_CREDENTIALS);
     };
-    start_session(&state, &user, &client).await
+    start_session(&state, &user, &client, "login_succeeded").await
 }
 
 pub async fn setup(State(state): State<Arc<WebState>>, client: ClientInfo, Json(body): Json<SetupRequest>) -> Response {
@@ -310,6 +341,7 @@ pub async fn setup(State(state): State<Arc<WebState>>, client: ClientInfo, Json(
     }
     if !state.setup_token.verify(body.setup_token.trim()) {
         state.login_throttle.lock().await.record_failure(&ip_key, std::time::Instant::now());
+        audit_auth_failure(&state, "setup_failed", &body.username, &client, "setup_token_invalid");
         return error_response(StatusCode::FORBIDDEN, "setup_token_invalid");
     }
     let username = match normalize_username(&body.username) {
@@ -364,7 +396,7 @@ pub async fn setup(State(state): State<Arc<WebState>>, client: ClientInfo, Json(
             log::error!("Web MCP remained disabled after the first administrator was created: {error}");
         }
     }
-    start_session(&state, &user, &client).await
+    start_session(&state, &user, &client, "setup_completed").await
 }
 
 pub async fn check(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Json<AuthCheckResponse> {
@@ -389,6 +421,7 @@ pub async fn check(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Js
 
 pub async fn change_password(
     State(state): State<Arc<WebState>>,
+    client: ClientInfo,
     headers: HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Response {
@@ -412,6 +445,11 @@ pub async fn change_password(
     };
     if !verify_password(&body.old_password, &user.password_hash) {
         state.login_throttle.lock().await.record_failure(&user_key, std::time::Instant::now());
+        state.app.audit.record(
+            by_session(&session_user, "password_change_failed")
+                .ip(client.ip_string().as_deref())
+                .reason("old_password_invalid"),
+        );
         return error_response(StatusCode::UNAUTHORIZED, "old_password_invalid");
     }
     if let Err(code) = check_new_password(&body.new_password) {
@@ -440,11 +478,24 @@ pub async fn change_password(
             Vec::new()
         });
     forget_live_sessions_by_hash(&state, &revoked).await;
+    state.app.audit.record(
+        by_session(&session_user, "password_changed")
+            .ip(client.ip_string().as_deref())
+            .detail(serde_json::json!({ "other_sessions_revoked": revoked.len() })),
+    );
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
-pub async fn logout(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+pub async fn logout(
+    State(state): State<Arc<WebState>>,
+    client: ClientInfo,
+    MaybeUser(user): MaybeUser,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(user) = &user {
+        state.app.audit.record(by_session(user, "logout").ip(client.ip_string().as_deref()));
+    }
     if let Some(token) = session_token_from_headers(&headers) {
         if !state.password_disabled {
             if let Err(error) = state.session_manager.revoke(&state.app.storage, &token, now_millis()).await {
@@ -511,6 +562,11 @@ pub async fn auth_middleware(
     }
     let principal = Principal::User { user_id: user.user_id.clone(), groups: Vec::new(), role: user.role };
     state.app.authz.register_owner(&token, principal.clone());
+    if state.app.audit.is_enabled() {
+        let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|info| info.0.ip());
+        let client = client_info(req.headers(), peer, trust_proxy());
+        state.app.audit.remember_client(&token, client.ip_string().as_deref());
+    }
     req.extensions_mut().insert(principal);
     req.extensions_mut().insert(user);
     let owner = token;

@@ -6,11 +6,12 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use dbx_authz::{Effect, Operations, Principal, Resource, Scope, Subject};
 use dbx_core::storage::{
-    ConnectionAuthzPolicy, DataRole, StoredGrant, UserGroup, GRANT_INVALID, GRANT_NOT_FOUND, GROUP_NAME_TAKEN, GROUP_NOT_FOUND, ROLE_IN_USE,
-    ROLE_NAME_TAKEN, ROLE_NOT_FOUND,
+    ConnectionAuthzPolicy, DataRole, StoredGrant, UserGroup, GRANT_INVALID, GRANT_NOT_FOUND, GROUP_NAME_TAKEN,
+    GROUP_NOT_FOUND, ROLE_IN_USE, ROLE_NAME_TAKEN, ROLE_NOT_FOUND,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::audit_events::record_action;
 use crate::auth::{error_response, CurrentUser};
 use crate::sessions::now_millis;
 use crate::state::WebState;
@@ -136,45 +137,50 @@ pub async fn list_groups(State(state): State<Arc<WebState>>, _admin: CurrentUser
 
 pub async fn create_group(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<GroupRequest>,
 ) -> AccessResult {
     let name = clean_name(&body.name, "group_name_invalid")?;
     let description = clean_text(body.description)?;
     let group =
         state.app.storage.create_user_group(&name, description, now_millis()).await.map_err(AccessError::storage)?;
+    record_action(&state, &admin.0, "group_created", serde_json::json!({ "group_id": group.id, "name": group.name }));
     Ok((StatusCode::CREATED, Json(GroupView::from(group))).into_response())
 }
 
 pub async fn update_group(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<GroupRequest>,
 ) -> AccessResult {
     let id = body.id.ok_or(AccessError::new(StatusCode::BAD_REQUEST, "group_not_found"))?;
     let name = clean_name(&body.name, "group_name_invalid")?;
     let description = clean_text(body.description)?;
     state.app.storage.update_user_group(&id, &name, description).await.map_err(AccessError::storage)?;
+    record_action(&state, &admin.0, "group_updated", serde_json::json!({ "group_id": id, "name": name }));
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
 pub async fn set_group_members(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<GroupMembersRequest>,
 ) -> AccessResult {
+    let detail = serde_json::json!({ "group_id": body.id, "user_ids": body.user_ids });
     state.app.storage.set_user_group_members(&body.id, body.user_ids).await.map_err(AccessError::storage)?;
     reload(&state).await?;
+    record_action(&state, &admin.0, "group_members_set", detail);
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
 pub async fn delete_group(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<IdRequest>,
 ) -> AccessResult {
     state.app.storage.delete_user_group(&body.id).await.map_err(AccessError::storage)?;
     reload(&state).await?;
+    record_action(&state, &admin.0, "group_deleted", serde_json::json!({ "group_id": body.id }));
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
@@ -223,7 +229,7 @@ pub async fn list_roles(State(state): State<Arc<WebState>>, _admin: CurrentUser)
 
 pub async fn create_role(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<RoleRequest>,
 ) -> AccessResult {
     let name = clean_name(&body.name, "role_name_invalid")?;
@@ -231,12 +237,18 @@ pub async fn create_role(
     let description = clean_text(body.description)?;
     let role =
         state.app.storage.create_data_role(&name, operations, description).await.map_err(AccessError::storage)?;
+    record_action(
+        &state,
+        &admin.0,
+        "role_created",
+        serde_json::json!({ "role_id": role.id, "name": role.name, "operations": operation_names(role.operations) }),
+    );
     Ok((StatusCode::CREATED, Json(RoleView::from(role))).into_response())
 }
 
 pub async fn update_role(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<RoleRequest>,
 ) -> AccessResult {
     let id = body.id.ok_or(AccessError::new(StatusCode::BAD_REQUEST, "role_not_found"))?;
@@ -246,16 +258,23 @@ pub async fn update_role(
     let description = clean_text(body.description)?;
     state.app.storage.update_data_role(&id, &name, operations, description).await.map_err(AccessError::storage)?;
     reload(&state).await?;
+    record_action(
+        &state,
+        &admin.0,
+        "role_updated",
+        serde_json::json!({ "role_id": id, "name": name, "operations": operation_names(operations) }),
+    );
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
 pub async fn delete_role(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<IdRequest>,
 ) -> AccessResult {
     reject_builtin(&body.id)?;
     state.app.storage.delete_data_role(&body.id).await.map_err(AccessError::storage)?;
+    record_action(&state, &admin.0, "role_deleted", serde_json::json!({ "role_id": body.id }));
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
@@ -399,16 +418,35 @@ pub async fn save_grant(
     };
     let saved = state.app.storage.save_grant(grant).await.map_err(AccessError::storage)?;
     reload(&state).await?;
-    Ok(Json(GrantView::from(saved)).into_response())
+    let view = GrantView::from(saved);
+    record_action(&state, &admin.0, "grant_saved", serde_json::to_value(&view).unwrap_or_default());
+    Ok(Json(view).into_response())
 }
 
 pub async fn delete_grant(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<IdRequest>,
 ) -> AccessResult {
+    let removed = state
+        .app
+        .storage
+        .list_grants()
+        .await
+        .map_err(AccessError::storage)?
+        .into_iter()
+        .find(|grant| grant.id == body.id)
+        .map(GrantView::from);
     state.app.storage.delete_grant(&body.id).await.map_err(AccessError::storage)?;
     reload(&state).await?;
+    record_action(
+        &state,
+        &admin.0,
+        "grant_deleted",
+        removed
+            .and_then(|view| serde_json::to_value(view).ok())
+            .unwrap_or_else(|| serde_json::json!({ "id": body.id })),
+    );
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
@@ -521,18 +559,14 @@ pub async fn list_connection_policies(State(state): State<Arc<WebState>>, _admin
 
 pub async fn save_connection_policy(
     State(state): State<Arc<WebState>>,
-    _admin: CurrentUser,
+    admin: CurrentUser,
     Json(body): Json<ConnectionPolicyView>,
 ) -> AccessResult {
     if !state.app.configs.read().await.contains_key(&body.connection_id) {
         return Err(AccessError::new(StatusCode::NOT_FOUND, "connection_not_found"));
     }
-    let mut allowlist: Vec<String> = body
-        .function_allowlist
-        .iter()
-        .map(|name| name.trim().to_lowercase())
-        .filter(|name| !name.is_empty())
-        .collect();
+    let mut allowlist: Vec<String> =
+        body.function_allowlist.iter().map(|name| name.trim().to_lowercase()).filter(|name| !name.is_empty()).collect();
     allowlist.sort();
     allowlist.dedup();
     if allowlist.len() > MAX_ALLOWLIST_ENTRIES || !allowlist.iter().all(|name| valid_function_name(name)) {
@@ -545,6 +579,16 @@ pub async fn save_connection_policy(
     };
     state.app.storage.save_connection_authz_policy(policy).await.map_err(AccessError::storage)?;
     reload(&state).await?;
+    record_action(
+        &state,
+        &admin.0,
+        "connection_policy_saved",
+        serde_json::json!({
+            "connection_id": body.connection_id,
+            "strict_function_mode": body.strict_function_mode,
+            "function_allowlist": allowlist,
+        }),
+    );
     Ok(Json(ConnectionPolicyView {
         connection_id: body.connection_id,
         strict_function_mode: body.strict_function_mode,
