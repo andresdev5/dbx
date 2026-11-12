@@ -331,7 +331,7 @@ impl MySqlSqlFileExecutor {
             let parent_token = token.clone();
             let running_queries = state.running_queries.clone();
             let execution_id = execution_id.clone();
-            tokio::spawn(async move {
+            crate::connection::session_credentials::spawn_in_request_scope(async move {
                 parent_token.cancelled().await;
                 running_queries.cancel(&execution_id);
             })
@@ -368,7 +368,7 @@ impl MySqlSqlFileExecutor {
             let kill_timeout = self.budget.checkout_timeout;
             state.running_queries.register_interrupt(execution_id, move || {
                 let kill_opts = kill_opts.clone();
-                tokio::spawn(async move {
+                crate::connection::session_credentials::spawn_in_request_scope(async move {
                     if let Err(error) = db::mysql::kill_query_with_opts(kill_opts, connection_id, kill_timeout).await {
                         log::warn!("Failed to cancel MySQL SQL file import query {connection_id}: {error}");
                     }
@@ -2854,6 +2854,7 @@ async fn execute_statement_with_progress(
     emit: &mut impl FnMut(SqlFileProgress),
 ) -> Result<bool, String> {
     let statement = &controlled_statement.statement;
+    crate::authz::authorize_sql_for(state, &request.connection_id, Some(&request.database), &[&statement.sql]).await?;
     let continue_on_error = request.continue_on_error && !controlled_statement.stop_on_error;
     if token.is_cancelled() {
         let summary = statement_summary(&statement.sql);
@@ -3139,7 +3140,7 @@ async fn execute_sql_file_statement(
         let parent_token = token.clone();
         let running_queries = state.running_queries.clone();
         let execution_id = execution_id.clone();
-        tokio::spawn(async move {
+        crate::connection::session_credentials::spawn_in_request_scope(async move {
             parent_token.cancelled().await;
             running_queries.cancel(&execution_id);
         })

@@ -54,7 +54,7 @@ async fn finish_transfer_channel(state: &Arc<WebState>, transfer_id: &str, chann
     let state = state.clone();
     let transfer_id = transfer_id.to_string();
     let channel = channel.clone();
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         sleep(COMPLETED_TRANSFER_CHANNEL_TTL).await;
         let mut channels = state.transfer_progress_channels.write().await;
         if channels.get(&transfer_id).is_some_and(|current| Arc::ptr_eq(current, &channel)) {
@@ -82,6 +82,63 @@ pub struct PreviewTransferOwnershipRequest {
     pub request: TransferRequest,
 }
 
+async fn authorize_transfer(state: &WebState, req: &transfer::TransferRequest) -> Result<(), AppError> {
+    use super::data_access::{ensure_access, Target};
+    let mut target_operations = dbx_authz::Operations::INSERT | dbx_authz::Operations::IMPORT;
+    if req.create_table {
+        target_operations |= dbx_authz::Operations::CREATE;
+    }
+    if req.drop_target_before_create {
+        target_operations |= dbx_authz::Operations::DROP;
+    }
+    match req.mode {
+        transfer::TransferMode::Append => {}
+        transfer::TransferMode::Overwrite => {
+            target_operations |= dbx_authz::Operations::DELETE | dbx_authz::Operations::TRUNCATE
+        }
+        transfer::TransferMode::Upsert => target_operations |= dbx_authz::Operations::UPDATE,
+    }
+    let source_schema = Some(req.source_schema.as_str()).filter(|schema| !schema.trim().is_empty());
+    let target_schema = Some(req.target_schema.as_str()).filter(|schema| !schema.trim().is_empty());
+    if req.tables.is_empty() {
+        ensure_access(
+            &state.app,
+            &req.source_connection_id,
+            Target::database(&req.source_database),
+            dbx_authz::Operations::SELECT | dbx_authz::Operations::EXPORT,
+            "Transfer",
+        )
+        .await?;
+        return ensure_access(
+            &state.app,
+            &req.target_connection_id,
+            Target::database(&req.target_database),
+            target_operations,
+            "Transfer",
+        )
+        .await;
+    }
+    for table in &req.tables {
+        ensure_access(
+            &state.app,
+            &req.source_connection_id,
+            Target::schema_object(&req.source_database, source_schema, table),
+            dbx_authz::Operations::SELECT | dbx_authz::Operations::EXPORT,
+            "Transfer",
+        )
+        .await?;
+        ensure_access(
+            &state.app,
+            &req.target_connection_id,
+            Target::schema_object(&req.target_database, target_schema, table),
+            target_operations,
+            "Transfer",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn start_transfer(
     State(state): State<Arc<WebState>>,
     Json(body): Json<StartTransferRequest>,
@@ -99,7 +156,8 @@ pub async fn start_transfer(
         (dbx_core::models::connection::DatabaseType::Sqlite, dbx_core::models::connection::DatabaseType::Sqlite)
     } else {
         // Reject transfer early if the target connection is read-only
-        if let Some(name) = dbx_core::query::connection_readonly_name(&state.app, &req.target_connection_id).await {
+        authorize_transfer(&state, &req).await?;
+        if let Some(name) = dbx_core::query::read_only_protection_name(&state.app, &req.target_connection_id).await {
             return Err(AppError::from(format!(
                 "Read-only mode: target connection '{}' has read-only protection enabled. Transfer blocked.",
                 name
@@ -151,7 +209,7 @@ pub async fn start_transfer(
     let app = state.app.clone();
     let state_clone = state.clone();
 
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         if matches!(req.content, transfer::TransferContent::StructureOnly)
             && (matches!(source_db_type, dbx_core::models::connection::DatabaseType::MongoDb)
                 || matches!(target_db_type, dbx_core::models::connection::DatabaseType::MongoDb))

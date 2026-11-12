@@ -2314,7 +2314,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = crate::connection::session_credentials::spawn_in_request_scope(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 1024];
             let request_size = stream.read(&mut request).await.unwrap();
@@ -2354,7 +2354,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = crate::connection::session_credentials::spawn_in_request_scope(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 1024];
             let request_size = stream.read(&mut request).await.unwrap();
@@ -2395,7 +2395,7 @@ mod tests {
         let redirect_address = redirect_listener.local_addr().unwrap();
         let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_address = target_listener.local_addr().unwrap();
-        let redirect_server = tokio::spawn(async move {
+        let redirect_server = crate::connection::session_credentials::spawn_in_request_scope(async move {
             let (mut stream, _) = redirect_listener.accept().await.unwrap();
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).await.unwrap();
@@ -2432,7 +2432,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = crate::connection::session_credentials::spawn_in_request_scope(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).await.unwrap();

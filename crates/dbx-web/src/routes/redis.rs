@@ -5,24 +5,10 @@ use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
 
+use super::data_access::{ensure_access, Target};
 use crate::error::AppError;
 use crate::state::WebState;
 use dbx_core::db::redis_driver::{RedisKeyMetadata, RedisKeysExpiryResult};
-
-/// Check if a connection is read-only and return an error if so.
-async fn ensure_writable(
-    app: &dbx_core::connection::AppState,
-    connection_id: &str,
-    action: &str,
-) -> Result<(), AppError> {
-    if let Some(name) = dbx_core::query::connection_readonly_name(app, connection_id).await {
-        return Err(AppError::from(format!(
-            "Read-only mode: connection '{}' has read-only protection enabled. {} blocked.",
-            name, action
-        )));
-    }
-    Ok(())
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,6 +354,9 @@ pub async fn scan_keys(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisScanRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result = dbx_core::redis_ops::redis_scan_keys_core(
         &state.app,
         &req.connection_id,
@@ -385,6 +374,9 @@ pub async fn scan_keys_batch(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisScanBatchRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result = dbx_core::redis_ops::redis_scan_keys_batch_core(
         &state.app,
         &req.connection_id,
@@ -404,6 +396,9 @@ pub async fn scan_values(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisValueScanRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result = dbx_core::redis_ops::redis_scan_values_core(
         &state.app,
         &req.connection_id,
@@ -423,6 +418,9 @@ pub async fn get_value(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisValueRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result = dbx_core::redis_ops::redis_get_value_in_db_with_preview_limit_core(
         &state.app,
         &req.connection_id,
@@ -439,6 +437,9 @@ pub async fn get_raw_value(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisKeyRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result =
         dbx_core::redis_ops::redis_get_raw_value_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw)
             .await
@@ -450,6 +451,9 @@ pub async fn get_ttl(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisKeyRequest>,
 ) -> Result<Json<i64>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let ttl = dbx_core::redis_ops::redis_get_ttl_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw)
         .await
         .map_err(AppError::from)?;
@@ -460,6 +464,9 @@ pub async fn get_stream_entries(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisStreamEntriesRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result = dbx_core::redis_ops::redis_stream_entries_in_db_core(
         &state.app,
         &req.connection_id,
@@ -476,6 +483,9 @@ pub async fn get_stream_groups(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisKeyRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result =
         dbx_core::redis_ops::redis_stream_groups_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw)
             .await
@@ -487,6 +497,9 @@ pub async fn get_stream_consumers(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisStreamGroupRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result = dbx_core::redis_ops::redis_stream_consumers_in_db_core(
         &state.app,
         &req.connection_id,
@@ -503,6 +516,9 @@ pub async fn get_stream_pending(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisStreamPendingRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result = dbx_core::redis_ops::redis_stream_pending_in_db_core(
         &state.app,
         &req.connection_id,
@@ -521,6 +537,9 @@ pub async fn load_more(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisLoadMoreRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result = dbx_core::redis_ops::redis_load_more_in_db_core(
         &state.app,
         &req.connection_id,
@@ -541,7 +560,15 @@ pub async fn set_string(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisSetStringRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "SET").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::INSERT | dbx_authz::Operations::UPDATE,
+        "SET",
+    )
+    .await?;
     dbx_core::redis_ops::redis_set_string_in_db_core(
         &state.app,
         &req.connection_id,
@@ -559,7 +586,15 @@ pub async fn delete_key(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisKeyRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "Delete key").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::DELETE,
+        "Delete key",
+    )
+    .await?;
     dbx_core::redis_ops::redis_delete_key_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw)
         .await
         .map_err(AppError::from)?;
@@ -570,7 +605,15 @@ pub async fn rename_key(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisRenameKeyRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "RENAMENX").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::UPDATE,
+        "RENAMENX",
+    )
+    .await?;
     dbx_core::redis_ops::redis_rename_key_in_db_core(
         &state.app,
         &req.connection_id,
@@ -587,7 +630,15 @@ pub async fn hash_set(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisHashRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "HSET").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::INSERT | dbx_authz::Operations::UPDATE,
+        "HSET",
+    )
+    .await?;
     let value = req.value.as_deref().unwrap_or("");
     dbx_core::redis_ops::redis_hash_set_in_db_core(
         &state.app,
@@ -607,7 +658,9 @@ pub async fn hash_del(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisHashRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "HDEL").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::UPDATE, "HDEL")
+        .await?;
     dbx_core::redis_ops::redis_hash_del_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, &req.field)
         .await
         .map_err(AppError::from)?;
@@ -618,7 +671,15 @@ pub async fn hash_field_update(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisHashFieldUpdateRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "Atomic hash field update").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::UPDATE,
+        "Atomic hash field update",
+    )
+    .await?;
     dbx_core::redis_ops::redis_hash_field_update_in_db_core(
         &state.app,
         &req.connection_id,
@@ -637,7 +698,15 @@ pub async fn hash_field_set_ttl(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisHashFieldTtlRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "HEXPIRE").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::UPDATE,
+        "HEXPIRE",
+    )
+    .await?;
     dbx_core::redis_ops::redis_hash_field_set_ttl_in_db_core(
         &state.app,
         &req.connection_id,
@@ -655,7 +724,15 @@ pub async fn hash_field_set_expire_at(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisHashFieldExpireAtRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "HEXPIREAT").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::UPDATE,
+        "HEXPIREAT",
+    )
+    .await?;
     dbx_core::redis_ops::redis_hash_field_set_expire_at_in_db_core(
         &state.app,
         &req.connection_id,
@@ -673,7 +750,15 @@ pub async fn list_push(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisListRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "LPUSH").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::INSERT | dbx_authz::Operations::UPDATE,
+        "LPUSH",
+    )
+    .await?;
     let value = req.value.as_deref().unwrap_or("");
     let side = dbx_core::redis_ops::ListPushSide::from_str_lossy(req.side.as_deref());
     dbx_core::redis_ops::redis_list_push_in_db_core(
@@ -694,7 +779,9 @@ pub async fn list_set(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisListRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "LSET").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::UPDATE, "LSET")
+        .await?;
     let index = req.index.unwrap_or(0);
     let value = req.value.as_deref().unwrap_or("");
     dbx_core::redis_ops::redis_list_set_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, index, value)
@@ -707,7 +794,9 @@ pub async fn list_remove(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisListRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "LREM").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::UPDATE, "LREM")
+        .await?;
     let index = req.index.unwrap_or(0);
     dbx_core::redis_ops::redis_list_remove_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, index)
         .await
@@ -719,7 +808,15 @@ pub async fn set_add(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisSetRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "SADD").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::INSERT | dbx_authz::Operations::UPDATE,
+        "SADD",
+    )
+    .await?;
     dbx_core::redis_ops::redis_set_add_in_db_core(
         &state.app,
         &req.connection_id,
@@ -737,7 +834,9 @@ pub async fn set_remove(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisSetRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "SREM").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::UPDATE, "SREM")
+        .await?;
     dbx_core::redis_ops::redis_set_remove_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, &req.member)
         .await
         .map_err(AppError::from)?;
@@ -745,7 +844,15 @@ pub async fn set_remove(
 }
 
 pub async fn zadd(State(state): State<Arc<WebState>>, Json(req): Json<RedisZaddRequest>) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "ZADD").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::INSERT | dbx_authz::Operations::UPDATE,
+        "ZADD",
+    )
+    .await?;
     dbx_core::redis_ops::redis_zadd_in_db_core(
         &state.app,
         &req.connection_id,
@@ -764,7 +871,15 @@ pub async fn zset_update(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisZsetUpdateRequest>,
 ) -> Result<Json<bool>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "ZADD/ZREM").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::UPDATE,
+        "ZADD/ZREM",
+    )
+    .await?;
     let used_acl_compatibility = dbx_core::redis_ops::redis_zset_update_in_db_core(
         &state.app,
         &req.connection_id,
@@ -784,7 +899,15 @@ pub async fn stream_add(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisStreamAddRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "XADD").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::INSERT | dbx_authz::Operations::UPDATE,
+        "XADD",
+    )
+    .await?;
     dbx_core::redis_ops::redis_stream_add_in_db_core(
         &state.app,
         &req.connection_id,
@@ -803,7 +926,15 @@ pub async fn json_set(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisJsonSetRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "JSON.SET").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::INSERT | dbx_authz::Operations::UPDATE,
+        "JSON.SET",
+    )
+    .await?;
     dbx_core::redis_ops::redis_json_set_in_db_core(
         &state.app,
         &req.connection_id,
@@ -821,6 +952,9 @@ pub async fn check_json_module(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisDbRequest>,
 ) -> Result<Json<bool>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result = dbx_core::redis_ops::redis_check_json_module_in_db_core(&state.app, &req.connection_id, req.db)
         .await
         .map_err(AppError::from)?;
@@ -831,7 +965,9 @@ pub async fn set_ttl(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisSetTtlRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "EXPIRE").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::UPDATE, "EXPIRE")
+        .await?;
     dbx_core::redis_ops::redis_set_ttl_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, req.ttl)
         .await
         .map_err(AppError::from)?;
@@ -842,7 +978,15 @@ pub async fn set_expire_at(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisSetExpireAtRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "EXPIREAT").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::UPDATE,
+        "EXPIREAT",
+    )
+    .await?;
     dbx_core::redis_ops::redis_set_expire_at_in_db_core(
         &state.app,
         &req.connection_id,
@@ -859,6 +1003,9 @@ pub async fn key_metadata_batch(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisKeyMetadataBatchRequest>,
 ) -> Result<Json<Vec<RedisKeyMetadata>>, AppError> {
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::SELECT, "Read")
+        .await?;
     let result =
         dbx_core::redis_ops::redis_key_metadata_batch_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raws)
             .await
@@ -870,7 +1017,9 @@ pub async fn set_keys_ttl(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisKeysTtlRequest>,
 ) -> Result<Json<RedisKeysExpiryResult>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "EXPIRE").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(&state.app, &req.connection_id, Target::database(&authz_db), dbx_authz::Operations::UPDATE, "EXPIRE")
+        .await?;
     let result = dbx_core::redis_ops::redis_set_keys_ttl_in_db_core(
         &state.app,
         &req.connection_id,
@@ -887,7 +1036,15 @@ pub async fn set_keys_expire_at(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisKeysExpireAtRequest>,
 ) -> Result<Json<RedisKeysExpiryResult>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "EXPIREAT").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::UPDATE,
+        "EXPIREAT",
+    )
+    .await?;
     let result = dbx_core::redis_ops::redis_set_keys_expire_at_in_db_core(
         &state.app,
         &req.connection_id,
@@ -904,7 +1061,15 @@ pub async fn delete_keys(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisKeysRequest>,
 ) -> Result<Json<u64>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "Delete keys").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::DELETE,
+        "Delete keys",
+    )
+    .await?;
     let result =
         dbx_core::redis_ops::redis_delete_keys_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raws)
             .await
@@ -916,7 +1081,15 @@ pub async fn delete_keys_by_pattern(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisKeysByPatternRequest>,
 ) -> Result<Json<u64>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "Delete keys").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::DELETE,
+        "Delete keys",
+    )
+    .await?;
     let result = dbx_core::redis_ops::redis_delete_keys_by_pattern_in_db_core(
         &state.app,
         &req.connection_id,
@@ -932,7 +1105,15 @@ pub async fn flush_db(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisDbRequest>,
 ) -> Result<Json<()>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "FLUSHDB").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::TRUNCATE,
+        "FLUSHDB",
+    )
+    .await?;
     dbx_core::redis_ops::redis_flush_db_core(&state.app, &req.connection_id, req.db).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
@@ -971,8 +1152,17 @@ pub async fn execute_command(
             .await?;
         }
     }
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        super::data_access::redis_command_operations(&cmd_name),
+        &format!("Command '{cmd_name}'"),
+    )
+    .await?;
     // In read-only mode, only allow safe read commands
-    if let Some(name) = dbx_core::query::connection_readonly_name(&state.app, &req.connection_id).await {
+    if let Some(name) = dbx_core::query::read_only_protection_name(&state.app, &req.connection_id).await {
         if safety != dbx_core::db::redis_driver::RedisCommandSafety::Allowed {
             return Err(AppError::from(format!(
                 "Read-only mode: connection '{}' has read-only protection enabled. Command '{}' blocked.",
@@ -996,7 +1186,15 @@ pub async fn publish_message(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisPubSubPublishRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    ensure_writable(&state.app, &req.connection_id, "PUBLISH").await?;
+    let authz_db = req.db.to_string();
+    ensure_access(
+        &state.app,
+        &req.connection_id,
+        Target::database(&authz_db),
+        dbx_authz::Operations::INSERT,
+        "PUBLISH",
+    )
+    .await?;
     let count =
         dbx_core::redis_ops::redis_publish_core(&state.app, &req.connection_id, req.db, &req.channel, &req.message)
             .await
@@ -1008,6 +1206,8 @@ pub async fn slowlog_get(
     State(state): State<Arc<WebState>>,
     Json(req): Json<SlowlogGetRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_access(&state.app, &req.connection_id, Target::connection(), dbx_authz::Operations::UNCLASSIFIED, "SLOWLOG")
+        .await?;
     let result = dbx_core::redis_ops::redis_slowlog_get_core(
         &state.app,
         &req.connection_id,
@@ -1024,6 +1224,8 @@ pub async fn cluster_master_nodes(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ClusterNodesRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_access(&state.app, &req.connection_id, Target::anywhere(), dbx_authz::Operations::SELECT, "Cluster nodes")
+        .await?;
     let result = dbx_core::redis_ops::redis_cluster_master_nodes_core(&state.app, &req.connection_id)
         .await
         .map_err(AppError::from)?;

@@ -71,7 +71,7 @@ fn send_import_progress(tx: &tokio::sync::watch::Sender<String>, progress: &Tabl
 fn schedule_import_progress_cleanup(state: Arc<WebState>, import_id: String) {
     // Keep the terminal snapshot briefly so an SSE client that connects after completion can
     // still observe the result, then release the channel and its captured state.
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         tokio::time::sleep(TABLE_IMPORT_PROGRESS_TTL).await;
         state.table_import_channels.write().await.remove(&import_id);
     });
@@ -302,8 +302,30 @@ pub async fn execute_import(
     let file_path = validated_uploaded_import_path(&state.data_dir, &req.file_path)?;
     req.file_path = file_path.to_string_lossy().to_string();
 
+    let mut import_operations = dbx_authz::Operations::INSERT | dbx_authz::Operations::IMPORT;
+    if req.create_table {
+        import_operations |= dbx_authz::Operations::CREATE;
+    }
+    if matches!(req.mode, dbx_core::table_import::TableImportMode::Truncate) {
+        import_operations |= dbx_authz::Operations::TRUNCATE;
+    }
+    let import_schema = Some(req.schema.as_str()).filter(|schema| !schema.trim().is_empty());
+    if let Err(error) = super::data_access::ensure_access(
+        &state.app,
+        &req.connection_id,
+        super::data_access::Target::schema_object(&req.database, import_schema, &req.table),
+        import_operations,
+        "Import",
+    )
+    .await
+    {
+        if !req.retain_source {
+            cleanup_uploaded_import_source(&req.file_path).await;
+        }
+        return Err(error);
+    }
     // Reject import early if the connection is read-only
-    if let Some(name) = dbx_core::query::connection_readonly_name(&state.app, &req.connection_id).await {
+    if let Some(name) = dbx_core::query::read_only_protection_name(&state.app, &req.connection_id).await {
         if !req.retain_source {
             cleanup_uploaded_import_source(&req.file_path).await;
         }
@@ -325,7 +347,7 @@ pub async fn execute_import(
     let app = state.app.clone();
     let state_clone = state.clone();
 
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         let db_type = match transfer::get_db_type(&app, &req.connection_id).await {
             Ok(t) => t,
             Err(e) => {

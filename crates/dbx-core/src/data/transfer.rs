@@ -1365,7 +1365,7 @@ async fn list_transfer_tables_isolated(
     table: String,
     limit: usize,
 ) -> Result<Vec<db::TableInfo>, String> {
-    let task = tokio::spawn(async move {
+    let task = crate::connection::session_credentials::spawn_in_request_scope(async move {
         if let Some(catalog) = resolve_external_transfer_catalog(catalog.as_deref(), &db_type) {
             crate::schema::list_doris_catalog_tables_core(
                 &state,
@@ -1405,7 +1405,7 @@ async fn get_transfer_table_comment_isolated(
     schema: String,
     table: String,
 ) -> Result<Option<String>, String> {
-    let task = tokio::spawn(async move {
+    let task = crate::connection::session_credentials::spawn_in_request_scope(async move {
         crate::schema::get_table_comment_core(&state, &connection_id, &database, &schema, &table).await
     });
     let _abort_on_drop = AbortTransferTaskOnDrop(task.abort_handle());
@@ -14568,7 +14568,7 @@ where
     let (source_count_tx, mut source_count_rx) = tokio::sync::mpsc::channel(1);
     let operation_timeout_secs = current_transfer_operation_timeout_secs();
 
-    let mut task = tokio::spawn(async move {
+    let mut task = crate::connection::session_credentials::spawn_in_request_scope(async move {
         let mut task_pending_fk_alters = Vec::new();
         let result = with_transfer_operation_timeout(
             operation_timeout_secs,
@@ -16046,7 +16046,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = crate::connection::session_credentials::spawn_in_request_scope(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             let header_end = loop {

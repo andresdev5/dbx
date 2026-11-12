@@ -931,15 +931,22 @@ pub async fn check_read_only_for_connection_multi(
 /// This uses connection_id directly (not pool_key), so it is safe to call at command entry points
 /// before any pool key is constructed.
 pub async fn connection_readonly_name(state: &AppState, connection_id: &str) -> Option<String> {
-    // Invalid compatibility configuration also fails closed at this Option-only
-    // legacy action boundary; connection setup reports the validation details.
-    if mysql_data_charset_policy::enabled_for_connection(state, connection_id).await.unwrap_or(true) {
-        return Some(format!("{connection_id} (MySQL dataCharset read-only)"));
+    if let Some(name) = read_only_protection_name(state, connection_id).await {
+        return Some(name);
     }
     if let Err(message) =
         crate::authz::authorize_connection_operations(state, connection_id, dbx_authz::Operations::UNCLASSIFIED).await
     {
         return Some(format!("{connection_id} ({message})"));
+    }
+    None
+}
+
+pub async fn read_only_protection_name(state: &AppState, connection_id: &str) -> Option<String> {
+    // Invalid compatibility configuration also fails closed at this Option-only
+    // legacy action boundary; connection setup reports the validation details.
+    if mysql_data_charset_policy::enabled_for_connection(state, connection_id).await.unwrap_or(true) {
+        return Some(format!("{connection_id} (MySQL dataCharset read-only)"));
     }
     let name = {
         let configs = state.configs.read().await;
@@ -2000,7 +2007,7 @@ async fn do_execute_typed(
                 let kill_timeout = operation_budget.checkout_timeout;
                 state.running_queries.register_interrupt(execution_id, move || {
                     let kill_opts = kill_opts.clone();
-                    tokio::spawn(async move {
+                    crate::connection::session_credentials::spawn_in_request_scope(async move {
                         if let Err(error) =
                             db::mysql::kill_query_with_opts(kill_opts, connection_id, kill_timeout).await
                         {
@@ -6409,7 +6416,7 @@ async fn exec_tx_sqlite_worker_inner(
 ) -> Result<db::QueryResult, String> {
     // Detached like the local spawn_blocking path, so a dropped caller cannot leave the
     // worker connection inside an open transaction. One session keeps other requests out.
-    tokio::spawn(async move {
+    crate::connection::session_credentials::spawn_in_request_scope(async move {
         let mut session = worker.session().await;
         session.query("BEGIN", None).await.map_err(|e| format!("Failed to begin transaction: {e}"))?;
         // ponytail: the worker cannot interrupt a running statement, so the budget is only
@@ -6948,7 +6955,7 @@ pub async fn keep_manual_transaction_alive(
     let keep_alive_sessions = Arc::clone(&sessions);
     let txn_session_id = txn_session_id.to_string();
     let keep_alive_txn_session_id = txn_session_id.clone();
-    let task = tokio::spawn(async move {
+    let task = crate::connection::session_credentials::spawn_in_request_scope(async move {
         const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
         loop {
             tokio::time::sleep(KEEPALIVE_INTERVAL).await;
@@ -7866,7 +7873,7 @@ fn spawn_txn_idle_watcher_for_sessions(
     sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, TransactionSession>>>,
     txn_session_id: String,
 ) {
-    tokio::spawn(async move {
+    crate::connection::session_credentials::spawn_in_request_scope(async move {
         // The window is fixed per session at BEGIN; a vanished session needs no watcher.
         let Some(idle_timeout) = sessions.read().await.get(&txn_session_id).map(|session| session.idle_timeout) else {
             return;
@@ -8205,7 +8212,7 @@ mod tests {
                 let mut fail_once = self.fail_once;
                 Box::pin(async move {
                     let (client_socket, mut server_socket) = tokio::io::duplex(8192);
-                    tokio::spawn(async move {
+                    crate::connection::session_credentials::spawn_in_request_scope(async move {
                         let startup_length = server_socket.read_u32().await.unwrap();
                         let mut startup = vec![0; startup_length as usize - 4];
                         server_socket.read_exact(&mut startup).await.unwrap();
@@ -8256,7 +8263,7 @@ mod tests {
                         }
                     });
                     let (client, connection) = config.connect_raw(client_socket, tokio_postgres::NoTls).await?;
-                    let task = tokio::spawn(async move {
+                    let task = crate::connection::session_credentials::spawn_in_request_scope(async move {
                         let _ = connection.await;
                     });
                     Ok((client, task))
@@ -8659,7 +8666,10 @@ mod tests {
         let remote = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().expect("open remote SQLite")));
         remote.lock().unwrap().execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").expect("create table");
         let (client_stream, worker_stream) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(fake_sqlite_ssh_worker(worker_stream, remote.clone()));
+        crate::connection::session_credentials::spawn_in_request_scope(fake_sqlite_ssh_worker(
+            worker_stream,
+            remote.clone(),
+        ));
         let pool = db::sqlite::SqliteHandle::from_worker(Arc::new(
             db::sqlite_worker::SqliteWorkerClient::from_test_stream(client_stream),
         ));
@@ -8841,7 +8851,7 @@ mod tests {
             RunningTaskMetadata::query(connection_id, "", Some(client_session_id.to_string())),
         );
         let first_state = state.clone();
-        let first = tokio::spawn(async move {
+        let first = crate::connection::session_credentials::spawn_in_request_scope(async move {
             execute_sql_statement_with_options_typed(
                 first_state.as_ref(),
                 connection_id,
@@ -8883,7 +8893,7 @@ mod tests {
             RunningTaskMetadata::query(connection_id, "", Some(client_session_id.to_string())),
         );
         let next_state = state.clone();
-        let mut next = tokio::spawn(async move {
+        let mut next = crate::connection::session_credentials::spawn_in_request_scope(async move {
             execute_sql_statement_with_options_typed(
                 next_state.as_ref(),
                 connection_id,
@@ -11402,7 +11412,7 @@ for line in sys.stdin:
         let holder_guard = client.lock().await;
 
         let waiter_client = client.clone();
-        let waiter = tokio::spawn(async move {
+        let waiter = crate::connection::session_credentials::spawn_in_request_scope(async move {
             let (_guard, wait_ms) = lock_shared_client_with_wait(&waiter_client, None, None).await.unwrap();
             wait_ms
         });
@@ -13952,7 +13962,7 @@ for line in sys.stdin:
         let state = std::sync::Arc::new(state);
         let hang_state = state.clone();
         let hang_session = txn_session_id.clone();
-        let hung = tokio::spawn(async move {
+        let hung = crate::connection::session_credentials::spawn_in_request_scope(async move {
             execute_in_manual_transaction_with_options(
                 &hang_state,
                 &hang_session,

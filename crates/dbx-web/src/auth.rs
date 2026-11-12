@@ -519,6 +519,16 @@ pub async fn auth_middleware(
 
 pub struct CurrentUser(pub SessionUser);
 
+pub struct MaybeUser(pub Option<SessionUser>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeUser {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(MaybeUser(parts.extensions.get::<SessionUser>().cloned()))
+    }
+}
+
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for CurrentUser {
     type Rejection = Response;
 

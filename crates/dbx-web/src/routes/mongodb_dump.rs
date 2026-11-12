@@ -344,7 +344,7 @@ async fn start_task(state: Arc<WebState>, task: Task) -> Result<Json<serde_json:
             channel.send(json, TransferReplayEventKind::Terminal);
         }
         transfer::clear_cancelled(&task_id).await;
-        tokio::spawn(async move {
+        dbx_core::session_credentials::spawn_in_request_scope(async move {
             tokio::time::sleep(Duration::from_secs(60)).await;
             state.transfer_progress_channels.write().await.remove(&key);
         });
@@ -352,11 +352,41 @@ async fn start_task(state: Arc<WebState>, task: Task) -> Result<Json<serde_json:
     Ok(Json(serde_json::json!({ "taskId": id })))
 }
 
+async fn authorize_collections(
+    state: &WebState,
+    connection_id: &str,
+    database: &str,
+    collections: Option<&[String]>,
+    operations: dbx_authz::Operations,
+    action: &str,
+) -> Result<(), AppError> {
+    use super::data_access::{ensure_access, Target};
+    match collections.filter(|collections| !collections.is_empty()) {
+        Some(collections) => {
+            for collection in collections {
+                ensure_access(&state.app, connection_id, Target::object(database, collection), operations, action)
+                    .await?;
+            }
+            Ok(())
+        }
+        None => ensure_access(&state.app, connection_id, Target::database(database), operations, action).await,
+    }
+}
+
 pub async fn start_dump(
     State(state): State<Arc<WebState>>,
     Json(body): Json<DumpWrapper>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut request = body.request;
+    authorize_collections(
+        &state,
+        &request.connection_id,
+        &request.database,
+        request.collections.as_deref(),
+        dbx_authz::Operations::SELECT | dbx_authz::Operations::EXPORT,
+        "Database export",
+    )
+    .await?;
     if request.format != MongoDumpFormat::Archive {
         return Err(AppError::from("Web database exports use MongoDB archive format".to_string()));
     }
@@ -374,6 +404,20 @@ pub async fn start_restore(
     State(state): State<Arc<WebState>>,
     Json(body): Json<RestoreWrapper>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let request = &body.request;
+    let mut operations = dbx_authz::Operations::INSERT | dbx_authz::Operations::IMPORT | dbx_authz::Operations::CREATE;
+    if request.drop_existing {
+        operations |= dbx_authz::Operations::DROP;
+    }
+    authorize_collections(
+        &state,
+        &request.connection_id,
+        &request.database,
+        request.collections.as_deref(),
+        operations,
+        "Database restore",
+    )
+    .await?;
     start_task(state, Task::Restore(body.request)).await
 }
 

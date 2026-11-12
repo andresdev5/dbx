@@ -39,6 +39,14 @@ pub async fn start_query_result_export(
     Json(body): Json<StartQueryResultExportRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut req = body.request;
+    super::data_access::ensure_access(
+        &state.app,
+        &req.connection_id,
+        super::data_access::Target::within_database(&req.database),
+        dbx_authz::Operations::EXPORT,
+        "Export",
+    )
+    .await?;
     dbx_core::query::mysql_data_charset_policy::check_export(&state.app, &req.connection_id, &req.format)
         .await
         .map_err(AppError::from)?;

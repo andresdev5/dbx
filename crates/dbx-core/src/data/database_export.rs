@@ -3177,7 +3177,7 @@ async fn get_export_table_ddl_isolated(
     table: String,
     client_session_id: String,
 ) -> Result<String, String> {
-    let task = tokio::spawn(async move {
+    let task = crate::connection::session_credentials::spawn_in_request_scope(async move {
         crate::schema::get_table_relation_export_ddl_core_for_session(
             &state,
             &connection_id,
@@ -3201,7 +3201,7 @@ async fn get_export_table_columns_isolated(
     table: String,
     client_session_id: String,
 ) -> Result<Vec<crate::db::ColumnInfo>, String> {
-    let task = tokio::spawn(async move {
+    let task = crate::connection::session_credentials::spawn_in_request_scope(async move {
         crate::schema::get_columns_core_for_session(
             &state,
             &connection_id,
@@ -6583,7 +6583,7 @@ mod tests {
         let export_id = format!("cancel-pending-{}", uuid::Uuid::new_v4());
         clear_export_cancelled(&export_id).await;
         let task_export_id = export_id.clone();
-        let task = tokio::spawn(async move {
+        let task = crate::connection::session_credentials::spawn_in_request_scope(async move {
             await_export_operation(
                 &task_export_id,
                 Box::pin(async {
@@ -6621,7 +6621,7 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let cleaned_after_cancel = cleaned.clone();
         let task_export_id = export_id.clone();
-        let task = tokio::spawn(async move {
+        let task = crate::connection::session_credentials::spawn_in_request_scope(async move {
             await_export_stream_operation(&task_export_id, &cancel_token, async move {
                 stream_cancel_token.cancelled().await;
                 cleaned_after_cancel.store(true, Ordering::SeqCst);

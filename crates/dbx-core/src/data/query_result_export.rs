@@ -1935,7 +1935,7 @@ async fn try_export_mysql_query_result_stream(
         let kill_timeout = operation_budget.checkout_timeout;
         state.running_queries.register_interrupt(&execution_id, move || {
             let kill_opts = interrupt_kill_opts.clone();
-            tokio::spawn(async move {
+            crate::connection::session_credentials::spawn_in_request_scope(async move {
                 if let Err(error) =
                     crate::db::mysql::kill_query_with_opts(kill_opts, mysql_connection_id, kill_timeout).await
                 {
@@ -1953,7 +1953,7 @@ async fn try_export_mysql_query_result_stream(
     let cancel_for_watcher = cancel_token.clone();
     // Normal UI cancellation uses running query cancellation and KILL QUERY.
     // This covers callers that only set the export-cancelled flag.
-    tokio::spawn(async move {
+    crate::connection::session_credentials::spawn_in_request_scope(async move {
         loop {
             tokio::select! {
                 biased;
@@ -4010,7 +4010,7 @@ mod tests {
         let progress_clock = Arc::new(StreamProgressClock::new());
         let cancel_token = CancellationToken::new();
         let cancel_token_for_task = cancel_token.clone();
-        let task = tokio::spawn(async move {
+        let task = crate::connection::session_credentials::spawn_in_request_scope(async move {
             await_stream_with_progress_timeout(
                 async { std::future::pending::<Result<(), String>>().await },
                 Some(Duration::from_secs(1)),

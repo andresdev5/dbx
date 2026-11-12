@@ -291,7 +291,9 @@ mod tests {
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+        let task = dbx_core::session_credentials::spawn_in_request_scope(async move {
+            axum::serve(listener, routes).await.unwrap()
+        });
         (directory, state, TestServer { address, task })
     }
 
@@ -645,7 +647,7 @@ for line in sys.stdin:
         let mut changed = serde_json::to_value(&profiles).unwrap();
         changed[0]["password"] = serde_json::json!("changed-secret");
         let address = routes.address;
-        let save = tokio::spawn(async move {
+        let save = dbx_core::session_credentials::spawn_in_request_scope(async move {
             reqwest::Client::new()
                 .post(format!("http://{address}/tunnel-profiles/save"))
                 .header("cookie", "dbx_session=first")
@@ -698,7 +700,7 @@ for line in sys.stdin:
         changed["password"] = serde_json::json!("replacement-secret");
         let other = crate::credentials::redact_tunnel(profiles[1].clone());
         let address = routes.address;
-        let save = tokio::spawn(async move {
+        let save = dbx_core::session_credentials::spawn_in_request_scope(async move {
             reqwest::Client::new()
                 .post(format!("http://{address}/tunnel-profiles/save"))
                 .header("cookie", "dbx_session=first")
@@ -1123,7 +1125,7 @@ for line in sys.stdin:
         let mut changed = original.clone();
         changed.host = "127.0.0.2".into();
         let address = routes.address;
-        let save = tokio::spawn(async move {
+        let save = dbx_core::session_credentials::spawn_in_request_scope(async move {
             reqwest::Client::new()
                 .post(format!("http://{address}/connection/save"))
                 .header("cookie", "dbx_session=first")
@@ -1172,7 +1174,7 @@ for line in sys.stdin:
         let driver = state.app.agent_manager.driver_dir("oracle");
         std::fs::write(driver.join("delay-close"), "ready").unwrap();
         let address = routes.address;
-        let load = tokio::spawn(async move {
+        let load = dbx_core::session_credentials::spawn_in_request_scope(async move {
             reqwest::Client::new()
                 .get(format!("http://{address}/connection/list"))
                 .header("cookie", "dbx_session=first")
@@ -1686,7 +1688,7 @@ for line in sys.stdin:
             let driver = state.app.agent_manager.driver_dir("oracle");
             std::fs::write(driver.join("delay-inspect"), b"1").unwrap();
             let address = routes.address;
-            let pending = tokio::spawn(async move {
+            let pending = dbx_core::session_credentials::spawn_in_request_scope(async move {
                 reqwest::Client::new()
                     .post(format!("http://{address}/pl-debug/inspect"))
                     .header("cookie", "dbx_session=first")

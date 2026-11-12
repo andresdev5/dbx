@@ -13,16 +13,43 @@ use crate::{connection::AppState, database_export::record_export_destination_ide
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum BackupCommand {
     Snapshot,
-    Preview { schedule: BackupSchedule },
-    Save { schedule: BackupSchedule },
-    DeleteSchedule { id: String },
-    Migrate { migration: Migration },
-    Run { request: RunRequest },
-    Cancel { id: String },
-    Rename { id: String, name: String },
-    DeleteRuns { ids: Vec<String> },
-    File { id: String, index: usize },
-    Import { files: Vec<String> },
+    Preview {
+        schedule: BackupSchedule,
+    },
+    Save {
+        schedule: BackupSchedule,
+    },
+    DeleteSchedule {
+        id: String,
+    },
+    Migrate {
+        migration: Migration,
+    },
+    Run {
+        request: RunRequest,
+    },
+    Cancel {
+        id: String,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
+    DeleteRuns {
+        ids: Vec<String>,
+    },
+    File {
+        id: String,
+        index: usize,
+    },
+    Import {
+        files: Vec<String>,
+    },
+    SetOwner {
+        id: String,
+        #[serde(rename = "ownerUserId")]
+        owner_user_id: String,
+    },
 }
 
 /// Source of history entries for backup files created outside DBX, such as Navicat `.nb3` archives.
@@ -64,10 +91,13 @@ impl BackupService {
                 value["destinationRoot"] = serde_json::to_value(&self.root).map_err(|e| e.to_string())?;
                 Ok(value)
             }
-            BackupCommand::Save { schedule } => {
+            BackupCommand::Save { mut schedule } => {
                 schedule.validate()?;
                 self.validate_destination(&schedule.config.destination_directory)?;
                 let old = self.store.snapshot().await?.schedules.into_iter().find(|s| s.id == schedule.id);
+                if schedule.owner_user_id.is_none() {
+                    schedule.owner_user_id = old.as_ref().and_then(|existing| existing.owner_user_id.clone());
+                }
                 if old.is_none_or(|s| s.config.destination_directory != schedule.config.destination_directory) {
                     record_export_destination_identity(&self.state, Path::new(&schedule.config.destination_directory))
                         .await?;
@@ -106,6 +136,18 @@ impl BackupService {
             }
             BackupCommand::Import { files } => {
                 serde_json::to_value(self.import_files(files).await?).map_err(|e| e.to_string())
+            }
+            BackupCommand::SetOwner { id, owner_user_id } => {
+                let mut schedule = self
+                    .store
+                    .snapshot()
+                    .await?
+                    .schedules
+                    .into_iter()
+                    .find(|schedule| schedule.id == id)
+                    .ok_or("Backup schedule not found")?;
+                schedule.owner_user_id = Some(owner_user_id);
+                serde_json::to_value(self.store.save_schedule(schedule).await?).map_err(|e| e.to_string())
             }
         }
     }

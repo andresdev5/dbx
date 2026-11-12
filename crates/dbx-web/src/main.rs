@@ -692,6 +692,11 @@ async fn serve() -> Result<(), String> {
         .unwrap_or_else(|| web_state.data_dir.join("backups"));
     std::fs::create_dir_all(&backup_root).expect("Failed to create server backup root");
     let backup_service = routes::scheduled_backup::service(&web_state).expect("Failed to resolve server backup root");
+    if !password_disabled {
+        if let Err(error) = routes::scheduled_backup::migrate_backup_access(&web_state, &backup_service).await {
+            log::error!("Failed to grant existing scheduled backups their system access: {error}");
+        }
+    }
     let backup_stop = tokio_util::sync::CancellationToken::new();
     let backup_worker = backup_service.start(backup_stop.clone());
 

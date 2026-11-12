@@ -419,7 +419,7 @@ pub async fn ai_stream(
     let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
 
     let sid = session_id.clone();
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         let result = dbx_core::ai::stream(&sid, &request, &cancelled, |chunk: AiStreamChunk| {
             let json = serde_json::to_string(&chunk).unwrap_or_default();
             let _ = tx.send(json);
@@ -681,7 +681,7 @@ mod tests {
         let url = format!("http://{addr}");
         let count = Arc::new(AtomicU32::new(0));
         let count2 = count.clone();
-        let srv = tokio::spawn(async move {
+        let srv = dbx_core::session_credentials::spawn_in_request_scope(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 count2.fetch_add(1, Ordering::SeqCst);
                 let mut buf = vec![0u8; 4096];

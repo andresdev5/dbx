@@ -135,7 +135,14 @@ impl BackupService {
         stop: CancellationToken,
         progress: watch::Sender<BackupRun>,
     ) -> BackupRun {
-        let result = self.export_job(&mut job, &state, &stop, &progress).await;
+        let owner = format!("system:backup:{}", job.run.id);
+        state.authz.register_owner(&owner, dbx_authz::Principal::System { task_id: Some(job.run.id.clone()) });
+        let result = crate::session_credentials::with_credential_owner(
+            Some(owner.clone()),
+            self.export_job(&mut job, &state, &stop, &progress),
+        )
+        .await;
+        state.authz.forget_owner(&owner);
         job.run.status = if stop.is_cancelled() {
             "cancelled"
         } else if result.is_ok() {
@@ -192,6 +199,18 @@ impl BackupService {
         };
         if databases.is_empty() {
             return Err("No databases are available for this backup".into());
+        }
+        for database in &databases {
+            crate::authz::authorize_resource(
+                state,
+                &job.config.connection_id,
+                Some(database),
+                None,
+                None,
+                dbx_authz::Operations::SELECT | dbx_authz::Operations::EXPORT,
+                false,
+            )
+            .await?;
         }
         let mut sensitive = true;
         if !postgres && job.config.table_filter_mode != "all" {

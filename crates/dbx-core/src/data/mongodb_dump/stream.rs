@@ -157,7 +157,7 @@ pub(super) async fn initialize_collection(
 }
 
 pub(super) async fn writable(state: &AppState, id: &str) -> Result<(), String> {
-    if let Some(name) = crate::query::connection_readonly_name(state, id).await {
+    if let Some(name) = crate::query::read_only_protection_name(state, id).await {
         return Err(format!("Read-only connection '{name}': restore blocked"));
     }
     Ok(())

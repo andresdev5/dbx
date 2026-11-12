@@ -99,7 +99,7 @@ impl ManagedSqlPreviews {
 
 pub fn start_sql_file_cleanup(state: &Arc<WebState>) {
     let state = Arc::downgrade(state);
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         loop {
             let Some(state) = state.upgrade() else { break };
             state.managed_sql_previews.cleanup(&state.data_dir.join("tmp/sql_file"), SQL_FILE_UPLOAD_MAX_AGE, true);
@@ -343,12 +343,20 @@ pub async fn execute_sql_file(
     let managed_previews = state.managed_sql_previews.claim(&file_paths)?;
 
     // Fast-fail: reject early if the connection is read-only (individual statements are also checked in do_execute)
-    if let Some(name) = dbx_core::query::connection_readonly_name(&state.app, &req.connection_id).await {
+    if let Some(name) = dbx_core::query::read_only_protection_name(&state.app, &req.connection_id).await {
         return Err(AppError::from(format!(
             "Read-only mode: connection '{}' has read-only protection enabled. SQL file execution blocked.",
             name
         )));
     }
+    super::data_access::ensure_access(
+        &state.app,
+        &req.connection_id,
+        super::data_access::Target::within_database(&req.database),
+        dbx_authz::Operations::IMPORT,
+        "SQL file execution",
+    )
+    .await?;
 
     let execution_id = req.execution_id.clone();
     if requested_paths.is_empty() {
@@ -371,7 +379,7 @@ pub async fn execute_sql_file(
     let app = state.app.clone();
     let state_clone = state.clone();
 
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         let _managed_previews = managed_previews;
         let started_at = std::time::Instant::now();
         let mut failure_log = start_web_failure_log(&state_clone, &req, &file_paths).await;
@@ -770,7 +778,7 @@ pub async fn sql_file_progress(
     };
     if created {
         let state = state.clone();
-        tokio::spawn(async move {
+        dbx_core::session_credentials::spawn_in_request_scope(async move {
             tokio::time::sleep(PENDING_SQL_FILE_PROGRESS_CHANNEL_TTL).await;
             if !state.sql_file_executions.read().await.contains_key(&execution_id) {
                 state.remove_sse_channel(&execution_id).await;

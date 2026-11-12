@@ -566,6 +566,27 @@ impl Storage {
         .await
     }
 
+    pub async fn authz_flag(&self, key: &str) -> Result<bool, String> {
+        let key = format!("authz_flag:{key}");
+        self.with_conn(move |conn| {
+            conn.query_row("SELECT 1 FROM app_state WHERE key = ?1", params![key], |_| Ok(()))
+                .optional()
+                .map(|found| found.is_some())
+                .map_err(sql_error)
+        })
+        .await
+    }
+
+    pub async fn set_authz_flag(&self, key: &str) -> Result<(), String> {
+        let key = format!("authz_flag:{key}");
+        self.with_conn(move |conn| {
+            conn.execute("INSERT OR REPLACE INTO app_state (key, value_json) VALUES (?1, 'true')", params![key])
+                .map(|_| ())
+                .map_err(sql_error)
+        })
+        .await
+    }
+
     pub async fn load_authz_snapshot(&self) -> Result<AuthzSnapshot, String> {
         self.with_conn(|conn| {
             let roles: HashMap<String, Operations> = builtin_roles()

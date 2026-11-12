@@ -1,3 +1,4 @@
+use crate::auth::MaybeUser;
 use crate::{error::AppError, state::WebState};
 use axum::{
     body::Body,
@@ -6,7 +7,11 @@ use axum::{
     response::Response,
     Json,
 };
+use dbx_authz::{Effect, Operations, Principal, Resource, Scope, Subject};
+use dbx_core::authz::principal_allows;
+use dbx_core::scheduled_backup::BackupConfig;
 use dbx_core::scheduled_backup::{BackupCommand, BackupService};
+use dbx_core::storage::StoredGrant;
 use std::{path::PathBuf, sync::Arc};
 use tokio_util::io::ReaderStream;
 
@@ -18,9 +23,127 @@ pub fn service(state: &WebState) -> Result<BackupService, String> {
 
 pub async fn command(
     State(state): State<Arc<WebState>>,
-    Json(command): Json<BackupCommand>,
+    MaybeUser(user): MaybeUser,
+    Json(mut command): Json<BackupCommand>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    Ok(Json(service(&state)?.command(command).await?))
+    let service = service(&state)?;
+    if state.app.authz.is_enforced() {
+        match &mut command {
+            BackupCommand::Save { schedule } => {
+                let existing_owner = service
+                    .store
+                    .snapshot()
+                    .await?
+                    .schedules
+                    .into_iter()
+                    .find(|existing| existing.id == schedule.id)
+                    .and_then(|existing| existing.owner_user_id);
+                let owner = schedule
+                    .owner_user_id
+                    .clone()
+                    .or(existing_owner)
+                    .or_else(|| user.as_ref().map(|user| user.user_id.clone()))
+                    .ok_or_else(|| AppError::forbidden("backup_owner_missing"))?;
+                validate_backup_access(&state, &owner, &schedule.config).await?;
+                schedule.owner_user_id = Some(owner);
+            }
+            BackupCommand::SetOwner { owner_user_id, .. } => {
+                let owner = state.app.storage.find_web_user(owner_user_id).await?;
+                if !owner.is_some_and(|owner| owner.active) {
+                    return Err(AppError::not_found("backup_owner_not_found"));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Json(service.command(command).await?))
+}
+
+const BACKUP_OPERATIONS: Operations = Operations::SELECT.union(Operations::EXPORT);
+
+async fn validate_backup_access(state: &WebState, owner_id: &str, config: &BackupConfig) -> Result<(), AppError> {
+    let owner = state
+        .app
+        .storage
+        .find_web_user(owner_id)
+        .await?
+        .filter(|owner| owner.active)
+        .ok_or_else(|| AppError::not_found("backup_owner_not_found"))?;
+    let owner = Principal::User { user_id: owner.id, groups: Vec::new(), role: owner.role };
+    let owner = state.app.authz.with_groups(&owner);
+    let system = Principal::System { task_id: None };
+    let databases: Vec<Option<&str>> = if config.databases.is_empty() {
+        vec![None]
+    } else {
+        config.databases.iter().map(|database| Some(database.as_str())).collect()
+    };
+    for database in databases {
+        let target = database.unwrap_or(config.connection_id.as_str());
+        if !principal_allows(&state.app, &owner, &config.connection_id, database, BACKUP_OPERATIONS).await {
+            return Err(AppError::forbidden(format!(
+                "Permission denied: SELECT, EXPORT required on {target} for the backup owner"
+            )));
+        }
+        if !principal_allows(&state.app, &system, &config.connection_id, database, BACKUP_OPERATIONS).await {
+            return Err(AppError::forbidden(format!(
+                "Permission denied: SELECT, EXPORT required on {target} for the system principal"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub const BACKUP_ACCESS_MIGRATION: &str = "scheduled_backup_access_v1";
+
+pub async fn migrate_backup_access(state: &WebState, service: &BackupService) -> Result<(), String> {
+    let storage = &state.app.storage;
+    if storage.authz_flag(BACKUP_ACCESS_MIGRATION).await? {
+        return Ok(());
+    }
+    let schedules = service.store.snapshot().await?.schedules;
+    let grants = storage.list_grants().await?;
+    let connections: std::collections::BTreeSet<String> =
+        schedules.iter().map(|schedule| schedule.config.connection_id.clone()).collect();
+    for connection_id in connections {
+        let covered = grants.iter().any(|grant| {
+            grant.subject == Subject::System
+                && grant.effect == Effect::Allow
+                && match &grant.scope {
+                    Scope::All => true,
+                    Scope::Resource(resource) => resource.connection_id == connection_id && resource.database.is_none(),
+                    Scope::ConnectionGroup(_) => false,
+                }
+        });
+        if covered {
+            continue;
+        }
+        storage
+            .save_grant(StoredGrant {
+                id: uuid::Uuid::new_v4().to_string(),
+                subject: Subject::System,
+                scope: Scope::Resource(Resource::connection(connection_id)),
+                effect: Effect::Allow,
+                operations: Some(BACKUP_OPERATIONS),
+                role_id: None,
+                expires_at: None,
+                note: Some("Migrated so existing scheduled backups keep running".into()),
+                created_by: None,
+                created_at: crate::sessions::now_millis(),
+            })
+            .await?;
+    }
+    let admin = storage
+        .list_web_users()
+        .await?
+        .into_iter()
+        .find(|user| user.active && user.role == dbx_authz::PlatformRole::Admin);
+    if let Some(admin) = admin {
+        for schedule in schedules.into_iter().filter(|schedule| schedule.owner_user_id.is_none()) {
+            service.command(BackupCommand::SetOwner { id: schedule.id, owner_user_id: admin.id.clone() }).await?;
+        }
+    }
+    storage.set_authz_flag(BACKUP_ACCESS_MIGRATION).await?;
+    state.app.authz.reload(storage).await
 }
 
 pub async fn download(

@@ -919,7 +919,7 @@ pub async fn connection_idle_closed_events(
 /// 未启用阈值的连接会被 core 直接过滤）。
 pub fn start_connection_idle_sweeper(state: &Arc<WebState>) {
     let state = Arc::downgrade(state);
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         loop {
             let Some(state) = state.upgrade() else { break };
             state.app.sweep_idle_connections().await;
@@ -1736,7 +1736,7 @@ mod tests {
             profile_id: String::new(),
         })];
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let worker = tokio::spawn(async move {
+        let worker = dbx_core::session_credentials::spawn_in_request_scope(async move {
             let scoped_app = app.clone();
             super::with_temporary_connection_config(&app, config, move |id, config| async move {
                 let attempt = scoped_app.connection_endpoint_attempt(&id, &config).await?;
@@ -2129,12 +2129,12 @@ done
     async fn spawn_consul_agent_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        dbx_core::session_credentials::spawn_in_request_scope(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                tokio::spawn(async move {
+                dbx_core::session_credentials::spawn_in_request_scope(async move {
                     let mut buf = [0_u8; 2048];
                     let Ok(n) = stream.read(&mut buf).await else {
                         return;
@@ -2248,12 +2248,12 @@ done
     async fn spawn_pulsar_clusters_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        dbx_core::session_credentials::spawn_in_request_scope(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                tokio::spawn(async move {
+                dbx_core::session_credentials::spawn_in_request_scope(async move {
                     let mut buf = [0_u8; 1024];
                     let Ok(n) = stream.read(&mut buf).await else {
                         return;

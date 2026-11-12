@@ -72,6 +72,8 @@ pub struct BackupSchedule {
     pub last_run_at: Option<String>,
     #[serde(default)]
     pub last_run_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -134,7 +134,7 @@ async fn handle_pubsub_socket(socket: WebSocket, state: Arc<WebState>, connectio
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Task: Read WebSocket commands
-    let ws_read = tokio::spawn(async move {
+    let ws_read = dbx_core::session_credentials::spawn_in_request_scope(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Text(text) => {
@@ -149,7 +149,7 @@ async fn handle_pubsub_socket(socket: WebSocket, state: Arc<WebState>, connectio
     });
 
     // Task: Apply commands to PubSub sink
-    let sink_handle = tokio::spawn(async move {
+    let sink_handle = dbx_core::session_credentials::spawn_in_request_scope(async move {
         while let Some(text) = cmd_rx.recv().await {
             if let Err(e) = handle_pubsub_command(&mut sink, &text).await {
                 log::warn!("PubSub command error: {e}");

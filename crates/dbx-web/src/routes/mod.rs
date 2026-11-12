@@ -6,6 +6,7 @@ pub mod app_settings;
 pub mod cloud_sync;
 pub mod connection;
 pub mod consul;
+pub mod data_access;
 pub mod data_compare;
 pub mod database_export;
 pub mod dialect;

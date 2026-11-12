@@ -125,6 +125,7 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/admin/grants/delete", post(crate::routes::admin_access::delete_grant))
         .route("/api/admin/grants/effective", post(crate::routes::admin_access::effective))
         .route("/api/connection/list", get(crate::routes::connection::load_connections))
+        .route("/api/database-backups", post(crate::routes::scheduled_backup::command))
         .fallback(|| async { "handled" })
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
@@ -396,7 +397,7 @@ async fn a_regular_user_gets_admin_required_on_every_admin_route() {
                 "{method} {route}"
             );
             let allowed = send_method(&server, method, &format!("/api/{path}"), &admin).await;
-            assert_eq!(allowed.body, "handled", "{method} {route}");
+            assert_ne!(allowed.status, StatusCode::FORBIDDEN, "{method} {route}: {:?}", allowed.body);
             checked += 1;
         }
     }
@@ -664,4 +665,110 @@ async fn custom_roles_and_grant_validation() {
     assert_eq!(system.status, StatusCode::OK, "{:?}", system.body);
     let listed = server.post("/api/admin/grants/list", Some(&admin), json!({ "subject": { "kind": "system" } })).await;
     assert_eq!(listed.body.as_array().unwrap().len(), 1);
+}
+
+fn backup_schedule(id: &str, connection_id: &str, destination: &Path) -> Value {
+    json!({
+        "action": "save",
+        "schedule": {
+            "id": id, "name": "Nightly", "enabled": true, "connectionId": connection_id, "databases": ["main"],
+            "destinationDirectory": destination.to_string_lossy(), "includeStructure": true, "includeData": true,
+            "includeObjects": true, "frequency": "daily", "intervalHours": 1, "timeOfDay": "02:30", "weekday": 0,
+            "retentionCount": 2, "timeZone": "UTC", "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z", "nextRunAt": "2026-01-01T00:00:00Z"
+        }
+    })
+}
+
+#[tokio::test]
+async fn scheduled_backups_need_owner_and_system_access_and_keep_their_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    state.app.authz.set_enforced(true);
+    save_sqlite_connection(&state, "ventas", directory.path()).await;
+    state.app.configs.write().await.extend(
+        state.app.storage.load_connections().await.unwrap().into_iter().map(|config| (config.id.clone(), config)),
+    );
+    let destination = directory.path().join("backups").join("nightly");
+    std::fs::create_dir_all(&destination).unwrap();
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await;
+    let admin_id = admin.body["user"]["id"].as_str().unwrap().to_string();
+    let cookie = admin.cookie.unwrap();
+
+    let denied =
+        server.post("/api/database-backups", Some(&cookie), backup_schedule("nightly", "ventas", &destination)).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "{:?}", denied.body);
+    assert!(denied.body.to_string().contains("system principal"), "{:?}", denied.body);
+
+    server
+        .post(
+            "/api/admin/grants/save",
+            Some(&cookie),
+            json!({ "subject": { "kind": "system" }, "scope": { "kind": "resource", "value": { "connectionId": "ventas" } }, "effect": "allow", "operations": ["SELECT", "EXPORT"] }),
+        )
+        .await;
+    let saved =
+        server.post("/api/database-backups", Some(&cookie), backup_schedule("nightly", "ventas", &destination)).await;
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+    assert_eq!(saved.body["ownerUserId"], json!(admin_id));
+
+    create_user(&state, "ana", "ana-password", false).await;
+    let ana_id = state.app.storage.find_web_user_by_username("ana").await.unwrap().unwrap().id;
+    let reassigned = server
+        .post(
+            "/api/database-backups",
+            Some(&cookie),
+            json!({ "action": "setOwner", "id": "nightly", "ownerUserId": ana_id }),
+        )
+        .await;
+    assert_eq!(reassigned.body["ownerUserId"], json!(ana_id));
+    let missing = server
+        .post(
+            "/api/database-backups",
+            Some(&cookie),
+            json!({ "action": "setOwner", "id": "nightly", "ownerUserId": "ghost" }),
+        )
+        .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+
+    let resaved =
+        server.post("/api/database-backups", Some(&cookie), backup_schedule("nightly", "ventas", &destination)).await;
+    assert_eq!(
+        resaved.status,
+        StatusCode::FORBIDDEN,
+        "ana has no access, so the owner check must fail: {:?}",
+        resaved.body
+    );
+    assert!(resaved.body.to_string().contains("backup owner"), "{:?}", resaved.body);
+
+    let ana = state.app.storage.find_web_user_by_username("ana").await.unwrap().unwrap();
+    state.app.storage.set_web_user_active(&ana.id, false, now_millis()).await.unwrap();
+    let snapshot = crate::routes::scheduled_backup::service(&state).unwrap().store.snapshot().await.unwrap();
+    assert!(snapshot.schedules[0].enabled, "disabling the owner must not pause the schedule");
+}
+
+#[tokio::test]
+async fn existing_backups_are_migrated_to_system_access_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    save_sqlite_connection(&state, "ventas", directory.path()).await;
+    let destination = directory.path().join("backups").join("nightly");
+    std::fs::create_dir_all(&destination).unwrap();
+    let service = crate::routes::scheduled_backup::service(&state).unwrap();
+    let command: dbx_core::scheduled_backup::BackupCommand =
+        serde_json::from_value(backup_schedule("nightly", "ventas", &destination)).unwrap();
+    service.command(command).await.unwrap();
+
+    crate::routes::scheduled_backup::migrate_backup_access(&state, &service).await.unwrap();
+    let grants = state.app.storage.list_grants().await.unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].subject, dbx_authz::Subject::System);
+    let schedule = service.store.snapshot().await.unwrap().schedules.remove(0);
+    let admin = state.app.storage.find_web_user_by_username("admin").await.unwrap().unwrap();
+    assert_eq!(schedule.owner_user_id, Some(admin.id));
+
+    state.app.storage.delete_grant(&grants[0].id).await.unwrap();
+    crate::routes::scheduled_backup::migrate_backup_access(&state, &service).await.unwrap();
+    assert!(state.app.storage.list_grants().await.unwrap().is_empty(), "the migration runs only once");
 }

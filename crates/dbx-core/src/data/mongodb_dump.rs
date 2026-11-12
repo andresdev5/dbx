@@ -694,7 +694,7 @@ where
     let mut progress = MongoDatabaseDumpProgress::initial(&request.task_id);
     progress.emit(started, &mut on_progress);
     let result: Result<(), String> = async {
-        if let Some(name) = crate::query::connection_readonly_name(state, &request.connection_id).await {
+        if let Some(name) = crate::query::read_only_protection_name(state, &request.connection_id).await {
             return Err(format!("Read-only connection '{name}': restore blocked"));
         }
         if is_cancelled(&request.task_id).await {

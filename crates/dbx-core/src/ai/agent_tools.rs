@@ -1993,7 +1993,9 @@ mod tests {
         assert!(same_connection.try_lock().is_err(), "same connection must serialize tool calls");
         assert!(other_connection.try_lock().is_ok(), "different connections must remain concurrent");
 
-        let waiter = tokio::spawn(async move { same_connection.lock_owned().await });
+        let waiter = crate::connection::session_credentials::spawn_in_request_scope(async move {
+            same_connection.lock_owned().await
+        });
         tokio::task::yield_now().await;
         waiter.abort();
         let _ = waiter.await;

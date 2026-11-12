@@ -104,6 +104,17 @@ tokio::task_local! {
     static CREDENTIAL_OWNER: Option<String>;
 }
 
+pub fn spawn_in_request_scope<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match current_credential_owner() {
+        Some(owner) => tokio::spawn(with_credential_owner(Some(owner), future)),
+        None => tokio::spawn(future),
+    }
+}
+
 /// 内存会话凭据仓库：`(owner_scope, connection_id) -> password`。
 #[derive(Default)]
 pub struct SessionCredentialStore {
@@ -276,6 +287,17 @@ impl fmt::Debug for SessionCredentialStore {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn spawned_tasks_keep_the_request_owner() {
+        let seen = super::with_credential_owner(Some("token-a".into()), async {
+            super::spawn_in_request_scope(async { super::current_credential_owner() }).await.unwrap()
+        })
+        .await;
+        assert_eq!(seen.as_deref(), Some("token-a"));
+        let outside = super::spawn_in_request_scope(async { super::current_credential_owner() }).await.unwrap();
+        assert_eq!(outside, None);
+    }
+
     use super::SessionCredentialStore;
     use std::sync::{Arc, Barrier};
 

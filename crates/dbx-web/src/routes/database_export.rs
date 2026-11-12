@@ -36,6 +36,30 @@ pub async fn start_database_export(
     Json(body): Json<StartExportRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut req = body.request;
+    {
+        use super::data_access::{ensure_access, Target};
+        let export_schema = Some(req.schema.as_str()).filter(|schema| !schema.trim().is_empty());
+        if req.selected_tables.is_empty() {
+            ensure_access(
+                &state.app,
+                &req.connection_id,
+                Target::database(&req.database),
+                dbx_authz::Operations::SELECT | dbx_authz::Operations::EXPORT,
+                "Export",
+            )
+            .await?;
+        }
+        for table in &req.selected_tables {
+            ensure_access(
+                &state.app,
+                &req.connection_id,
+                Target::schema_object(&req.database, export_schema, table),
+                dbx_authz::Operations::SELECT | dbx_authz::Operations::EXPORT,
+                "Export",
+            )
+            .await?;
+        }
+    }
     dbx_core::query::mysql_data_charset_policy::reject_operation(
         &state.app,
         &req.connection_id,

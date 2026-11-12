@@ -593,7 +593,7 @@ pub async fn execute_conditional_update(
     let app = state.app.clone();
     let (result_tx, result_rx) = oneshot::channel();
 
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         let result = dbx_core::query::execute_sql_statement_with_options_typed(
             &app,
             &req.connection_id,
@@ -872,7 +872,7 @@ pub async fn prepare_large_value_download(
     );
     let cleanup_state = state.clone();
     let cleanup_id = download_id.clone();
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         if let Some(file) = cleanup_state.export_files.write().await.remove(&cleanup_id) {
             let _ = tokio::fs::remove_file(file.file_path).await;
@@ -922,7 +922,7 @@ pub async fn prepare_snapshot_export(
     );
     let cleanup_state = state.clone();
     let cleanup_id = download_id.clone();
-    tokio::spawn(async move {
+    dbx_core::session_credentials::spawn_in_request_scope(async move {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         if let Some(file) = cleanup_state.export_files.write().await.remove(&cleanup_id) {
             let _ = tokio::fs::remove_file(file.file_path).await;
@@ -1719,7 +1719,7 @@ mod tests {
             .running_queries
             .register_task_for_terminal_confirmation("old-caller".to_string(), Default::default());
         let token = registered.token();
-        let completion = tokio::spawn(async move {
+        let completion = dbx_core::session_credentials::spawn_in_request_scope(async move {
             token.cancelled().await;
             drop(registered);
         });

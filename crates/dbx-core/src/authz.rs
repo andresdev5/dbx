@@ -241,25 +241,81 @@ pub async fn authorize_connection_operations(
     }
 }
 
-pub async fn authorize_sql(state: &AppState, pool_key: &str, statements: &[&str]) -> Result<(), String> {
+pub async fn principal_allows(
+    state: &AppState,
+    principal: &Principal,
+    connection_id: &str,
+    database: Option<&str>,
+    operations: Operations,
+) -> bool {
+    let Some(config) = connection_config(state, connection_id).await else {
+        return false;
+    };
+    let mut resource = Resource::connection(config.id.clone());
+    resource.database = database.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+    principal_permissions(state, principal, &config).await.check(&Need::exact(resource, operations)).is_ok()
+}
+
+pub async fn authorize_resource(
+    state: &AppState,
+    connection_id: &str,
+    database: Option<&str>,
+    schema: Option<&str>,
+    table: Option<&str>,
+    operations: Operations,
+    within: bool,
+) -> Result<(), String> {
     let principal = match state.authz.current() {
         CurrentPrincipal::Unenforced => return Ok(()),
         CurrentPrincipal::Background | CurrentPrincipal::Unknown => return Err(missing_principal()),
         CurrentPrincipal::Known(principal) => principal,
     };
-    let config = {
-        let configs = state.configs.read().await;
-        crate::connection::config_for_pool_key(pool_key, &configs).cloned()
-    };
-    let Some(config) = config else {
+    let Some(config) = connection_config(state, connection_id).await else {
         return Err(format!("{PERMISSION_DENIED_PREFIX} unknown connection"));
     };
+    let clean = |value: Option<&str>| value.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+    let mut resource = Resource::connection(config.id.clone());
+    if let Some(database) = clean(database) {
+        resource.database = Some(database);
+        resource.schema = clean(schema);
+        resource.table = clean(table);
+    }
+    let need = if within { Need::within(resource, operations) } else { Need::exact(resource, operations) };
     let permissions = principal_permissions(state, &principal, &config).await;
-    let active_database = state
-        .authz
-        .pool_database(pool_key)
-        .unwrap_or(None)
-        .or_else(|| config.database.clone().filter(|database| !database.trim().is_empty()));
+    match denial_message(&permissions.authorize(&dbx_authz::Requirement::single(need))) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+pub async fn authorize_sql_for(
+    state: &AppState,
+    connection_id: &str,
+    database: Option<&str>,
+    statements: &[&str],
+) -> Result<(), String> {
+    let principal = match state.authz.current() {
+        CurrentPrincipal::Unenforced => return Ok(()),
+        CurrentPrincipal::Background | CurrentPrincipal::Unknown => return Err(missing_principal()),
+        CurrentPrincipal::Known(principal) => principal,
+    };
+    let Some(config) = connection_config(state, connection_id).await else {
+        return Err(format!("{PERMISSION_DENIED_PREFIX} unknown connection"));
+    };
+    let active_database = database.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+    authorize_statements(state, &principal, &config, active_database, statements).await
+}
+
+async fn authorize_statements(
+    state: &AppState,
+    principal: &Principal,
+    config: &ConnectionConfig,
+    active_database: Option<String>,
+    statements: &[&str],
+) -> Result<(), String> {
+    let permissions = principal_permissions(state, principal, config).await;
+    let active_database =
+        active_database.or_else(|| config.database.clone().filter(|database| !database.trim().is_empty()));
     let context = ResolveContext {
         connection_id: &config.id,
         active_database: active_database.as_deref(),
@@ -273,6 +329,23 @@ pub async fn authorize_sql(state: &AppState, pool_key: &str, statements: &[&str]
         }
     }
     Ok(())
+}
+
+pub async fn authorize_sql(state: &AppState, pool_key: &str, statements: &[&str]) -> Result<(), String> {
+    let principal = match state.authz.current() {
+        CurrentPrincipal::Unenforced => return Ok(()),
+        CurrentPrincipal::Background | CurrentPrincipal::Unknown => return Err(missing_principal()),
+        CurrentPrincipal::Known(principal) => principal,
+    };
+    let config = {
+        let configs = state.configs.read().await;
+        crate::connection::config_for_pool_key(pool_key, &configs).cloned()
+    };
+    let Some(config) = config else {
+        return Err(format!("{PERMISSION_DENIED_PREFIX} unknown connection"));
+    };
+    let active_database = state.authz.pool_database(pool_key).unwrap_or(None);
+    authorize_statements(state, &principal, &config, active_database, statements).await
 }
 
 #[cfg(test)]
@@ -449,6 +522,37 @@ mod tests {
         .await;
         assert!(run_as(&state, "ana-token", "INSERT INTO orders(status) VALUES ('x')").await.is_ok());
         assert!(run_as(&state, "ana-token", "DELETE FROM orders").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn system_tasks_only_get_system_grants() {
+        let (_root, state) = state(false).await;
+        enforce(
+            &state,
+            vec![grant(
+                "s",
+                Subject::System,
+                Scope::Resource(Resource::connection(CONNECTION).with_database("main")),
+                Effect::Allow,
+                Operations::SELECT | Operations::EXPORT,
+            )],
+            &[],
+        );
+        state.authz.register_owner("system:backup:run-1", Principal::System { task_id: Some("run-1".into()) });
+        let export = Operations::SELECT | Operations::EXPORT;
+        let as_system = |operations| {
+            with_credential_owner(
+                Some("system:backup:run-1".into()),
+                authorize_resource(&state, CONNECTION, Some("main"), None, None, operations, false),
+            )
+        };
+        assert!(as_system(export).await.is_ok());
+        assert!(as_system(Operations::DELETE).await.is_err());
+        assert!(principal_allows(&state, &Principal::System { task_id: None }, CONNECTION, Some("main"), export).await);
+        assert!(!principal_allows(&state, &user("ana"), CONNECTION, Some("main"), export).await);
+        assert!(
+            !principal_allows(&state, &Principal::System { task_id: None }, CONNECTION, Some("other"), export).await
+        );
     }
 
     #[test]
