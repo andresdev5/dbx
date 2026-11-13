@@ -85,6 +85,7 @@ const RULES: &[(&str, RouteClass)] = &[
     ("jdbc/**", Authenticated),
     ("WRITE jdbc/**", Admin),
     ("layout/**", Authenticated),
+    ("WRITE layout/sidebar", Admin),
     ("migration/status", Authenticated),
     ("migration/**", Admin),
     ("mongo/**", Authenticated),
@@ -308,6 +309,7 @@ mod tests {
             (Method::GET, "ssh/config-hosts"),
             (Method::POST, "tunnel-profiles/save"),
             (Method::POST, "admin/users/list"),
+            (Method::POST, "layout/sidebar"),
         ] {
             assert_eq!(classify(&method, path), Some(Admin), "{method} {path}");
         }
@@ -317,6 +319,8 @@ mod tests {
     fn everyday_work_stays_available_to_users() {
         for (method, path) in [
             (Method::GET, "connection/list"),
+            (Method::GET, "layout/sidebar"),
+            (Method::POST, "layout/table-vgroups"),
             (Method::POST, "connection/connect"),
             (Method::POST, "connection/database-info/save"),
             (Method::POST, "query/execute"),

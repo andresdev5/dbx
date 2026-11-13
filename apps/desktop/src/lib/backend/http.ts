@@ -6001,7 +6001,12 @@ export async function getAppSupportInfo(): Promise<AppSupportInfo> {
 // ---------------------------------------------------------------------------
 
 export async function saveSidebarLayout(layout: SidebarLayout): Promise<void> {
-  return post("/api/layout/sidebar", { layout });
+  try {
+    await post("/api/layout/sidebar", { layout });
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("admin_required")) return;
+    throw error;
+  }
 }
 
 export async function loadSidebarLayout(): Promise<SidebarLayout | null> {
