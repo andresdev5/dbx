@@ -169,6 +169,11 @@ pub struct WebState {
     /// `DBX_WEB_CAPTCHA` was set, so the settings dialog must not offer to
     /// change it.
     pub captcha_env_locked: bool,
+    pub captcha_provider: tokio::sync::RwLock<crate::captcha_provider::CaptchaProviderConfig>,
+    pub captcha_provider_env_locked: bool,
+    pub captcha_fallback: Mutex<crate::captcha_provider::CaptchaFallback>,
+    pub captcha_http: reqwest::Client,
+    pub captcha_targets: crate::captcha_provider::VerifyTargets,
     /// Completed Web export temp files waiting for the browser download.
     pub export_files: RwLock<HashMap<String, WebExportFile>>,
     pub ssh_prompts: Arc<crate::ssh_prompt::SshPromptHub>,
@@ -213,6 +218,11 @@ impl WebState {
             captchas: crate::captcha::CaptchaStore::new(),
             captcha_mode: tokio::sync::RwLock::new(crate::captcha::CaptchaMode::Auto),
             captcha_env_locked: false,
+            captcha_provider: tokio::sync::RwLock::new(Default::default()),
+            captcha_provider_env_locked: false,
+            captcha_fallback: Mutex::new(Default::default()),
+            captcha_http: reqwest::Client::new(),
+            captcha_targets: Default::default(),
             export_files: RwLock::new(HashMap::new()),
             ssh_prompts: Arc::new(crate::ssh_prompt::SshPromptHub::new()),
             migration_ready: Arc::new(AtomicBool::new(true)),

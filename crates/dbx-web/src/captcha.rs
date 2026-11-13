@@ -417,6 +417,10 @@ impl CaptchaStore {
         self.lock().get(id).map(|challenge| challenge.code.clone())
     }
 
+    pub(crate) fn answer_for_tests(&self, id: &str) -> Option<String> {
+        self.code_of(id)
+    }
+
     fn insert_for_test(&self, id: &str, code: &str, age: Duration) {
         self.lock().insert(id.to_string(), Challenge { code: code.to_string(), issued: Instant::now() - age });
     }

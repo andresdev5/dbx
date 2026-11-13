@@ -37,6 +37,8 @@ pub struct LoginRequest {
     pub captcha_id: Option<String>,
     #[serde(default)]
     pub captcha_code: Option<String>,
+    #[serde(default)]
+    pub captcha_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -56,9 +58,18 @@ pub struct CaptchaQuery {
 
 #[derive(Serialize)]
 pub struct CaptchaResponse {
+    pub provider: &'static str,
     pub id: String,
     pub image: String,
     pub expires_in: u64,
+}
+
+async fn external_captcha(state: &WebState) -> Option<crate::captcha_provider::CaptchaProviderConfig> {
+    let provider = state.captcha_provider.read().await.clone();
+    if !provider.active_external() || state.captcha_fallback.lock().await.active(std::time::Instant::now()) {
+        return None;
+    }
+    Some(provider)
 }
 
 #[derive(Deserialize)]
@@ -265,12 +276,23 @@ pub async fn captcha(
     if !mode.requires_challenge(failed_attempts) {
         return StatusCode::NO_CONTENT.into_response();
     }
+    if let Some(provider) = external_captcha(&state).await {
+        let settings = provider.settings;
+        let endpoint = (settings.provider == crate::captcha_provider::CaptchaProviderKind::Cap)
+            .then(|| format!("{}/{}/", settings.endpoint.trim_end_matches('/'), settings.site_key));
+        return (
+            StatusCode::OK,
+            [("cache-control", "no-store")],
+            Json(serde_json::json!({ "provider": settings.provider, "site_key": settings.site_key, "endpoint": endpoint })),
+        )
+            .into_response();
+    }
     let (id, png) = state.captchas.issue();
     let image = format!("data:image/png;base64,{}", BASE64.encode(&png));
     (
         StatusCode::OK,
         [("cache-control", "no-store")],
-        Json(CaptchaResponse { id, image, expires_in: CAPTCHA_TTL.as_secs() }),
+        Json(CaptchaResponse { provider: "builtin", id, image, expires_in: CAPTCHA_TTL.as_secs() }),
     )
         .into_response()
 }
@@ -294,12 +316,31 @@ pub async fn login(State(state): State<Arc<WebState>>, client: ClientInfo, Json(
     };
 
     if state.captcha_mode.read().await.requires_challenge(failed_attempts) {
-        let captcha_ok = state
-            .captchas
-            .verify(body.captcha_id.as_deref().unwrap_or_default(), body.captcha_code.as_deref().unwrap_or_default());
-        if !captcha_ok {
-            audit_auth_failure(&state, "login_failed", &body.username, &client, "captcha_invalid");
-            return error_response(StatusCode::BAD_REQUEST, "captcha_invalid");
+        if let Some(provider) = external_captcha(&state).await {
+            use crate::captcha_provider::{verify, Verification};
+            let token = body.captcha_token.as_deref().unwrap_or_default();
+            let ip = client.ip_string();
+            match verify(&state.captcha_http, &state.captcha_targets, &provider, token, ip.as_deref()).await {
+                Verification::Passed => {}
+                Verification::Rejected => {
+                    audit_auth_failure(&state, "login_failed", &body.username, &client, "captcha_invalid");
+                    return error_response(StatusCode::BAD_REQUEST, "captcha_invalid");
+                }
+                Verification::Unavailable => {
+                    state.captcha_fallback.lock().await.activate(std::time::Instant::now());
+                    audit_auth_failure(&state, "login_failed", &body.username, &client, "captcha_provider_unavailable");
+                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "captcha_provider_unavailable");
+                }
+            }
+        } else {
+            let captcha_ok = state.captchas.verify(
+                body.captcha_id.as_deref().unwrap_or_default(),
+                body.captcha_code.as_deref().unwrap_or_default(),
+            );
+            if !captcha_ok {
+                audit_auth_failure(&state, "login_failed", &body.username, &client, "captcha_invalid");
+                return error_response(StatusCode::BAD_REQUEST, "captcha_invalid");
+            }
         }
     }
 

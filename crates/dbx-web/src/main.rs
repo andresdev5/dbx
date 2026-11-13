@@ -2,6 +2,7 @@ mod audit_events;
 mod auth;
 mod bootstrap;
 mod captcha;
+mod captcha_provider;
 mod credentials;
 mod demo;
 mod engine_access;
@@ -220,6 +221,22 @@ async fn migrate_per_user_data(storage: &Storage) -> Result<(), String> {
     storage.set_authz_flag(PER_USER_DATA_MIGRATION).await?;
     log::info!("Assigned {assigned} existing history, saved SQL and editor entries to '{}'", admin.username);
     Ok(())
+}
+
+async fn load_captcha_provider(storage: &Storage) -> captcha_provider::CaptchaProviderConfig {
+    let settings = match storage.load_web_captcha_provider().await {
+        Ok(Some(value)) => serde_json::from_value(value).unwrap_or_default(),
+        Ok(None) => Default::default(),
+        Err(error) => {
+            log::warn!("Failed to load the captcha provider settings; using the built-in captcha: {error}");
+            return Default::default();
+        }
+    };
+    let secret = storage.load_web_captcha_secret().await.unwrap_or_else(|error| {
+        log::warn!("Failed to read the captcha provider secret: {error}");
+        None
+    });
+    captcha_provider::CaptchaProviderConfig { settings, secret }
 }
 
 async fn rotate_secret_key_if_requested(storage: &Storage) {
@@ -710,6 +727,11 @@ async fn serve() -> Result<(), String> {
         },
     };
 
+    let (captcha_provider, captcha_provider_env_locked) = match captcha_provider::CaptchaProviderConfig::from_env() {
+        Some(config) => (config, true),
+        None => (load_captcha_provider(&app_state.storage).await, false),
+    };
+
     let demo_mode = demo::demo_mode_from_env();
 
     let migration_ready = storage_migration_ready(&app_state).await;
@@ -745,6 +767,11 @@ async fn serve() -> Result<(), String> {
         captchas: captcha::CaptchaStore::new(),
         captcha_mode: tokio::sync::RwLock::new(captcha_mode),
         captcha_env_locked,
+        captcha_provider: tokio::sync::RwLock::new(captcha_provider),
+        captcha_provider_env_locked,
+        captcha_fallback: tokio::sync::Mutex::new(Default::default()),
+        captcha_http: reqwest::Client::new(),
+        captcha_targets: Default::default(),
         export_files: RwLock::new(HashMap::new()),
         ssh_prompts: Arc::new(ssh_prompt::SshPromptHub::new()),
         migration_ready: Arc::new(AtomicBool::new(migration_ready)),
@@ -801,6 +828,8 @@ async fn serve() -> Result<(), String> {
         .route("/admin/users/reset-password", post(routes::admin_users::reset_password))
         .route("/admin/users/delete", post(routes::admin_users::delete))
         .route("/admin/users/reset-mfa", post(routes::admin_users::reset_mfa))
+        .route("/admin/security/captcha", post(routes::admin_security::captcha_settings))
+        .route("/admin/security/captcha/save", post(routes::admin_security::save_captcha_provider))
         .route("/admin/users/set-mfa-required", post(routes::admin_users::set_mfa_required))
         .route("/admin/users/mfa-policy", post(routes::admin_users::mfa_policy))
         .route("/admin/users/mfa-policy/save", post(routes::admin_users::set_mfa_policy))

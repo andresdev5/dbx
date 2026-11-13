@@ -133,6 +133,8 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/admin/sessions/revoke", post(crate::routes::admin_audit::revoke_session))
         .route("/api/connection/list", get(crate::routes::connection::load_connections))
         .route("/api/database-backups", post(crate::routes::scheduled_backup::command))
+        .route("/api/admin/security/captcha", post(crate::routes::admin_security::captcha_settings))
+        .route("/api/admin/security/captcha/save", post(crate::routes::admin_security::save_captcha_provider))
         .route("/api/auth/mfa/verify", post(crate::routes::mfa::verify_login))
         .route("/api/auth/mfa/status", post(crate::routes::mfa::status))
         .route("/api/auth/mfa/setup", post(crate::routes::mfa::setup))
@@ -1232,4 +1234,88 @@ async fn two_factor_enrollment_login_recovery_and_policy() {
     assert_eq!(after_reset.body["mfa_setup_required"], true);
     assert!(after_reset.cookie.is_some());
     assert_eq!(verified.body["user"]["mfa_enabled"], true);
+}
+
+#[tokio::test]
+async fn external_captcha_providers_are_verified_and_fall_back_to_the_built_in_one() {
+    let (provider_address, recorded, provider_task) = crate::captcha_provider::test_server::spawn().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |state| *state.captcha_mode.get_mut() = CaptchaMode::Always).await;
+    let server = serve(state.clone()).await;
+    let builtin_login = |captcha: Value| async {
+        let captcha = captcha;
+        let mut body = json!({ "username": "admin", "password": ADMIN_PASSWORD });
+        body["captcha_id"] = captcha["id"].clone();
+        let answer = state.captchas.answer_for_tests(captcha["id"].as_str().unwrap()).unwrap();
+        body["captcha_code"] = json!(answer);
+        server.post("/api/auth/login", None, body).await
+    };
+    let first_captcha = server.get("/api/auth/captcha", None).await.body;
+    assert_eq!(first_captcha["provider"], "builtin");
+    let admin = builtin_login(first_captcha).await.cookie.unwrap();
+
+    let incomplete = server
+        .post(
+            "/api/admin/security/captcha/save",
+            Some(&admin),
+            json!({ "provider": "cap", "site_key": "site-1", "endpoint": "ftp://x", "secret": "s" }),
+        )
+        .await;
+    assert_eq!(incomplete.body["error"], "captcha_endpoint_invalid");
+    let saved = server
+        .post(
+            "/api/admin/security/captcha/save",
+            Some(&admin),
+            json!({ "provider": "cap", "site_key": "site-1", "endpoint": format!("http://{provider_address}/"), "secret": "cap-secret" }),
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+    assert_eq!(saved.body["has_secret"], true);
+    assert!(!saved.body.to_string().contains("cap-secret"));
+    assert_eq!(state.app.storage.load_web_captcha_secret().await.unwrap().as_deref(), Some("cap-secret"));
+
+    let widget = server.get("/api/auth/captcha", None).await.body;
+    assert_eq!(widget["provider"], "cap");
+    assert_eq!(widget["site_key"], "site-1");
+    assert_eq!(widget["endpoint"], format!("http://{provider_address}/site-1/"));
+    assert!(widget.get("image").is_none());
+
+    let login = |token: &'static str| {
+        let server = &server;
+        async move {
+            server
+                .post(
+                    "/api/auth/login",
+                    None,
+                    json!({ "username": "admin", "password": ADMIN_PASSWORD, "captcha_token": token }),
+                )
+                .await
+        }
+    };
+    assert!(login("token-good").await.cookie.is_some());
+    assert_eq!(login("token-bad").await.body["error"], "captcha_invalid");
+    assert_eq!(login("").await.body["error"], "captcha_invalid");
+    let down = login("token-down").await;
+    assert_eq!(down.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(down.body["error"], "captcha_provider_unavailable");
+    assert!(recorded
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(path, _, body)| path == "/site-1/siteverify" && body.contains("cap-secret")));
+
+    let fallback = server.get("/api/auth/captcha", None).await.body;
+    assert_eq!(fallback["provider"], "builtin");
+    assert!(login("token-good").await.cookie.is_none());
+    assert!(builtin_login(fallback).await.cookie.is_some());
+    let settings = server.post("/api/admin/security/captcha", Some(&admin), json!({})).await;
+    assert_eq!(settings.body["fallback_active"], true);
+
+    let builtin_again =
+        server.post("/api/admin/security/captcha/save", Some(&admin), json!({ "provider": "builtin" })).await;
+    assert_eq!(builtin_again.body["provider"], "builtin");
+    assert_eq!(builtin_again.body["has_secret"], false);
+    assert!(state.app.storage.load_web_captcha_secret().await.unwrap().is_none());
+    provider_task.abort();
 }

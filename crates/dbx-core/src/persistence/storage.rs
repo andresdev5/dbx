@@ -7,6 +7,7 @@ mod type_execution_receipts;
 mod web_audit;
 mod web_grants;
 mod web_mfa;
+mod web_security;
 mod web_users;
 pub use type_execution_receipts::{TypeExecutionBinding, TypeRecoveryContext};
 pub use web_audit::{AuditEntry, AuditFilter, MAX_AUDIT_PAGE};
