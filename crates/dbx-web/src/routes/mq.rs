@@ -1626,6 +1626,7 @@ mod tests {
             nacos_imports: RwLock::new(HashMap::new()),
             login_throttle: Mutex::new(LoginThrottle::default()),
             mfa_challenges: Mutex::new(crate::state::MfaChallenges::default()),
+            oidc_flows: Mutex::new(Default::default()),
             captchas: crate::captcha::CaptchaStore::new(),
             captcha_mode: tokio::sync::RwLock::new(crate::captcha::CaptchaMode::Auto),
             captcha_env_locked: false,

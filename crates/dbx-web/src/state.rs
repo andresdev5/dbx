@@ -161,6 +161,7 @@ pub struct WebState {
     pub nacos_imports: RwLock<HashMap<String, NacosImportContext>>,
     pub login_throttle: Mutex<LoginThrottle>,
     pub mfa_challenges: Mutex<MfaChallenges>,
+    pub oidc_flows: Mutex<crate::oidc::OidcFlows>,
     /// Single-use image challenges gating `auth::login`.
     pub captchas: crate::captcha::CaptchaStore,
     /// When `auth::login` demands a challenge. Editable from `设置 → 安全`
@@ -215,6 +216,7 @@ impl WebState {
             nacos_imports: RwLock::new(HashMap::new()),
             login_throttle: Mutex::new(LoginThrottle::default()),
             mfa_challenges: Mutex::new(MfaChallenges::default()),
+            oidc_flows: Mutex::new(Default::default()),
             captchas: crate::captcha::CaptchaStore::new(),
             captcha_mode: tokio::sync::RwLock::new(crate::captcha::CaptchaMode::Auto),
             captcha_env_locked: false,

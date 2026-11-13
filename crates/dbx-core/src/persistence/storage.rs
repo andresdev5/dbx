@@ -6,6 +6,7 @@ pub use dbx_drivers::runtime_config::{
 mod type_execution_receipts;
 mod web_audit;
 mod web_grants;
+mod web_identity;
 mod web_mfa;
 mod web_security;
 mod web_users;
@@ -14,6 +15,9 @@ pub use web_audit::{AuditEntry, AuditFilter, MAX_AUDIT_PAGE};
 pub use web_grants::{
     builtin_role_id, builtin_roles, AuthzSnapshot, ConnectionAuthzPolicy, DataRole, StoredGrant, UserGroup,
     GRANT_INVALID, GRANT_NOT_FOUND, GROUP_NAME_TAKEN, GROUP_NOT_FOUND, ROLE_IN_USE, ROLE_NAME_TAKEN, ROLE_NOT_FOUND,
+};
+pub use web_identity::{
+    IdentityProvider, IDENTITY_PROVIDER_IN_USE, IDENTITY_PROVIDER_NAME_TAKEN, IDENTITY_PROVIDER_NOT_FOUND,
 };
 pub use web_mfa::{UserMfa, MFA_NAMESPACE};
 pub use web_users::{NewWebUser, WebSession, WebUser, LAST_ADMIN, USERNAME_TAKEN, USER_NOT_FOUND};
@@ -2729,6 +2733,7 @@ impl Storage {
                 .chain(web_users::WEB_USER_SCHEMA_STATEMENTS)
                 .chain(web_grants::WEB_GRANT_SCHEMA_STATEMENTS)
                 .chain(web_audit::WEB_AUDIT_SCHEMA_STATEMENTS)
+                .chain(web_identity::WEB_IDENTITY_SCHEMA_STATEMENTS)
             {
                 conn.execute(statement, []).map_err(|e| e.to_string())?;
             }

@@ -9,6 +9,7 @@ mod engine_access;
 mod error;
 mod identity;
 mod mfa;
+mod oidc;
 mod request_context;
 mod route_policy;
 mod routes;
@@ -764,6 +765,7 @@ async fn serve() -> Result<(), String> {
         nacos_imports: RwLock::new(HashMap::new()),
         login_throttle: tokio::sync::Mutex::new(state::LoginThrottle::default()),
         mfa_challenges: tokio::sync::Mutex::new(state::MfaChallenges::default()),
+        oidc_flows: tokio::sync::Mutex::new(Default::default()),
         captchas: captcha::CaptchaStore::new(),
         captcha_mode: tokio::sync::RwLock::new(captcha_mode),
         captcha_env_locked,
@@ -829,6 +831,13 @@ async fn serve() -> Result<(), String> {
         .route("/admin/users/delete", post(routes::admin_users::delete))
         .route("/admin/users/reset-mfa", post(routes::admin_users::reset_mfa))
         .route("/admin/security/captcha", post(routes::admin_security::captcha_settings))
+        .route("/admin/identity-providers/list", post(routes::admin_identity::list))
+        .route("/admin/identity-providers/save", post(routes::admin_identity::save))
+        .route("/admin/identity-providers/delete", post(routes::admin_identity::delete))
+        .route("/admin/identity-providers/test", post(routes::admin_identity::test))
+        .route("/auth/providers", get(routes::sso::list_providers))
+        .route("/auth/oidc/{id}/start", get(routes::sso::start_oidc))
+        .route("/auth/oidc/callback", get(routes::sso::oidc_callback))
         .route("/admin/security/captcha/save", post(routes::admin_security::save_captcha_provider))
         .route("/admin/users/set-mfa-required", post(routes::admin_users::set_mfa_required))
         .route("/admin/users/mfa-policy", post(routes::admin_users::mfa_policy))

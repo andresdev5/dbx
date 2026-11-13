@@ -2835,6 +2835,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "hmac 0.12.1",
+ "jsonwebtoken",
  "log",
  "mime_guess",
  "pbkdf2 0.12.2",

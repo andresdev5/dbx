@@ -133,6 +133,11 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/admin/sessions/revoke", post(crate::routes::admin_audit::revoke_session))
         .route("/api/connection/list", get(crate::routes::connection::load_connections))
         .route("/api/database-backups", post(crate::routes::scheduled_backup::command))
+        .route("/api/admin/identity-providers/save", post(crate::routes::admin_identity::save))
+        .route("/api/admin/identity-providers/test", post(crate::routes::admin_identity::test))
+        .route("/api/auth/providers", get(crate::routes::sso::list_providers))
+        .route("/api/auth/oidc/{id}/start", get(crate::routes::sso::start_oidc))
+        .route("/api/auth/oidc/callback", get(crate::routes::sso::oidc_callback))
         .route("/api/admin/security/captcha", post(crate::routes::admin_security::captcha_settings))
         .route("/api/admin/security/captcha/save", post(crate::routes::admin_security::save_captcha_provider))
         .route("/api/auth/mfa/verify", post(crate::routes::mfa::verify_login))
@@ -1318,4 +1323,115 @@ async fn external_captcha_providers_are_verified_and_fall_back_to_the_built_in_o
     assert_eq!(builtin_again.body["has_secret"], false);
     assert!(state.app.storage.load_web_captcha_secret().await.unwrap().is_none());
     provider_task.abort();
+}
+
+fn query_param(url: &str, name: &str) -> String {
+    reqwest::Url::parse(url).unwrap().query_pairs().find(|(key, _)| key == name).unwrap().1.into_owned()
+}
+
+#[tokio::test]
+async fn oidc_single_sign_on_creates_links_and_rejects_accounts() {
+    use crate::oidc::test_provider;
+    let (_idp_address, idp, idp_task) = test_provider::spawn().await;
+    let issuer = idp.issuer.lock().unwrap().clone();
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    state.app.authz.set_enforced(true);
+    let group = state.app.storage.create_user_group("Engineers", None, 1).await.unwrap();
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let no_redirect = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let base = format!("http://{}", server.address);
+
+    let saved = server
+        .post(
+            "/api/admin/identity-providers/save",
+            Some(&admin),
+            json!({
+                "kind": "oidc", "name": "Keycloak", "auto_create_users": true, "default_group_id": group.id,
+                "secret": test_provider::CLIENT_SECRET,
+                "config": { "issuer": issuer, "client_id": test_provider::CLIENT_ID, "redirect_uri": format!("{base}/api/auth/oidc/callback") }
+            }),
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+    assert_eq!(saved.body["has_secret"], true);
+    assert!(!saved.body.to_string().contains(test_provider::CLIENT_SECRET));
+    let provider_id = saved.body["id"].as_str().unwrap().to_string();
+    let tested = server.post("/api/admin/identity-providers/test", Some(&admin), json!({ "id": provider_id })).await;
+    assert_eq!(tested.body["ok"], true, "{:?}", tested.body);
+    let public = server.get("/api/auth/providers", None).await;
+    assert_eq!(public.body[0]["name"], "Keycloak");
+    assert!(public.body[0].get("config").is_none());
+
+    let sign_in = |subject: &'static str, claims: Value| {
+        let (no_redirect, base, idp, provider_id) = (&no_redirect, &base, &idp, &provider_id);
+        async move {
+            let started = no_redirect.get(format!("{base}/api/auth/oidc/{provider_id}/start")).send().await.unwrap();
+            let location = started.headers()["location"].to_str().unwrap().to_string();
+            *idp.nonce.lock().unwrap() = query_param(&location, "nonce");
+            *idp.challenge.lock().unwrap() = query_param(&location, "code_challenge");
+            *idp.subject.lock().unwrap() = subject.to_string();
+            *idp.claims.lock().unwrap() = claims;
+            let state_param = query_param(&location, "state");
+            let callback = no_redirect
+                .get(format!("{base}/api/auth/oidc/callback?code=code-1&state={state_param}"))
+                .send()
+                .await
+                .unwrap();
+            let cookie = callback
+                .headers()
+                .get("set-cookie")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::to_string);
+            let target = callback
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            (cookie, target, state_param)
+        }
+    };
+
+    let (cookie, target, used_state) =
+        sign_in("kc-ana", json!({ "preferred_username": "ana.sso", "name": "Ana" })).await;
+    assert_eq!(target, "/");
+    let cookie = cookie.expect("session cookie");
+    let check = server.get("/api/auth/check", Some(&cookie)).await;
+    assert_eq!(check.body["user"]["username"], "ana.sso");
+    let user = state.app.storage.find_web_user_by_username("ana.sso").await.unwrap().unwrap();
+    assert_eq!(user.identity_provider, provider_id);
+    assert_eq!(state.app.storage.list_user_groups().await.unwrap()[0].member_ids, vec![user.id.clone()]);
+    let (second, _, _) = sign_in("kc-ana", json!({ "preferred_username": "renamed" })).await;
+    assert!(second.is_some());
+    assert_eq!(
+        state.app.storage.find_web_user_by_external_subject(&provider_id, "kc-ana").await.unwrap().unwrap().username,
+        "ana.sso"
+    );
+
+    let replay =
+        no_redirect.get(format!("{base}/api/auth/oidc/callback?code=code-1&state={used_state}")).send().await.unwrap();
+    assert!(replay.headers()["location"].to_str().unwrap().ends_with("/login?sso_error=sso_state_invalid"));
+
+    let (_, taken, _) = sign_in("kc-other", json!({ "preferred_username": "admin" })).await;
+    assert!(taken.ends_with("sso_error=sso_username_taken"), "{taken}");
+
+    server
+        .post(
+            "/api/admin/identity-providers/save",
+            Some(&admin),
+            json!({ "id": provider_id, "kind": "oidc", "name": "Keycloak", "auto_create_users": false,
+                    "config": { "issuer": issuer, "client_id": test_provider::CLIENT_ID, "redirect_uri": format!("{base}/api/auth/oidc/callback") } }),
+        )
+        .await;
+    let (_, not_provisioned, _) = sign_in("kc-bob", json!({ "preferred_username": "bob" })).await;
+    assert!(not_provisioned.ends_with("sso_error=sso_user_not_provisioned"), "{not_provisioned}");
+
+    state.app.storage.set_web_user_active(&user.id, false, now_millis()).await.unwrap();
+    let (_, disabled, _) = sign_in("kc-ana", json!({})).await;
+    assert!(disabled.ends_with("sso_error=sso_user_disabled"), "{disabled}");
+    assert_eq!(server.login("ana.sso", "!external").await.status, StatusCode::UNAUTHORIZED);
+    idp_task.abort();
 }

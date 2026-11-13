@@ -1,5 +1,6 @@
 pub mod admin_access;
 pub mod admin_audit;
+pub mod admin_identity;
 pub mod admin_security;
 pub mod admin_users;
 pub mod agents;
@@ -45,6 +46,7 @@ pub mod schema_diff;
 pub mod sql_file;
 pub mod ssh_config;
 pub mod ssh_prompt;
+pub mod sso;
 pub mod tab_runtime_cache;
 pub mod table_export;
 pub mod table_import;
