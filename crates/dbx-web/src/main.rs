@@ -201,6 +201,26 @@ async fn web_mcp_demo_gate(
     next.run(request).await
 }
 
+const PER_USER_DATA_MIGRATION: &str = "per_user_data_v1";
+
+async fn migrate_per_user_data(storage: &Storage) -> Result<(), String> {
+    if storage.authz_flag(PER_USER_DATA_MIGRATION).await? {
+        return Ok(());
+    }
+    let users = storage.list_web_users().await?;
+    let Some(admin) = users
+        .iter()
+        .filter(|user| user.active && user.role == dbx_authz::PlatformRole::Admin)
+        .min_by_key(|user| user.created_at)
+    else {
+        return Ok(());
+    };
+    let assigned = storage.assign_unowned_user_data(&admin.id).await?;
+    storage.set_authz_flag(PER_USER_DATA_MIGRATION).await?;
+    log::info!("Assigned {assigned} existing history, saved SQL and editor entries to '{}'", admin.username);
+    Ok(())
+}
+
 async fn rotate_secret_key_if_requested(storage: &Storage) {
     let previous = match dbx_core::persistence::secret_codec::SecretCodec::previous_from_env() {
         Ok(Some(previous)) => previous,
@@ -661,6 +681,7 @@ async fn serve() -> Result<(), String> {
 
     if !password_disabled {
         app_state.authz.set_enforced(true);
+        app_state.storage.enable_user_scoped_data();
         if let Err(error) = app_state.authz.reload(&app_state.storage).await {
             log::error!("Failed to load DBX Web permissions; only administrators keep access: {error}");
         }
@@ -742,6 +763,9 @@ async fn serve() -> Result<(), String> {
     if !password_disabled {
         if let Err(error) = routes::scheduled_backup::migrate_backup_access(&web_state, &backup_service).await {
             log::error!("Failed to grant existing scheduled backups their system access: {error}");
+        }
+        if let Err(error) = migrate_per_user_data(&web_state.app.storage).await {
+            log::error!("Failed to assign existing user data to the first administrator: {error}");
         }
     }
     let backup_stop = tokio_util::sync::CancellationToken::new();

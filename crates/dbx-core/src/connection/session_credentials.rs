@@ -109,9 +109,15 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match current_credential_owner() {
-        Some(owner) => tokio::spawn(with_credential_owner(Some(owner), future)),
-        None => tokio::spawn(future),
+    let owner = current_credential_owner();
+    match crate::persistence::data_scope::current_task_scope() {
+        Some(scope) => {
+            tokio::spawn(crate::persistence::data_scope::with_data_scope(scope, with_credential_owner(owner, future)))
+        }
+        None => match owner {
+            Some(owner) => tokio::spawn(with_credential_owner(Some(owner), future)),
+            None => tokio::spawn(future),
+        },
     }
 }
 

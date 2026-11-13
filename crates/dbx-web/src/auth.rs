@@ -561,6 +561,10 @@ pub async fn auth_middleware(
         state.sessions.write().await.insert(token.clone());
     }
     let principal = Principal::User { user_id: user.user_id.clone(), groups: Vec::new(), role: user.role };
+    let data_scope = dbx_core::persistence::data_scope::DataScope::User {
+        user_id: user.user_id.clone(),
+        sees_unowned: user.role == PlatformRole::Admin,
+    };
     state.app.authz.register_owner(&token, principal.clone());
     if state.app.audit.is_enabled() {
         let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|info| info.0.ip());
@@ -570,7 +574,11 @@ pub async fn auth_middleware(
     req.extensions_mut().insert(principal);
     req.extensions_mut().insert(user);
     let owner = token;
-    dbx_core::session_credentials::with_credential_owner(Some(owner), async move { next.run(req).await }).await
+    dbx_core::persistence::data_scope::with_data_scope(
+        data_scope,
+        dbx_core::session_credentials::with_credential_owner(Some(owner), async move { next.run(req).await }),
+    )
+    .await
 }
 
 pub struct CurrentUser(pub SessionUser);

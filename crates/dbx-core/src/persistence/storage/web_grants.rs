@@ -619,6 +619,35 @@ impl Storage {
         .await
     }
 
+    pub async fn assign_unowned_user_data(&self, owner_user_id: &str) -> Result<usize, String> {
+        use crate::persistence::data_scope::{USER_APP_STATE_KEYS, USER_DATA_TABLES};
+        let owner = owner_user_id.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction().map_err(sql_error)?;
+            let mut assigned = 0;
+            for table in USER_DATA_TABLES {
+                assigned += tx
+                    .execute(
+                        &format!("UPDATE {table} SET owner_user_id = ?1 WHERE owner_user_id IS NULL"),
+                        params![owner],
+                    )
+                    .map_err(sql_error)?;
+            }
+            for key in USER_APP_STATE_KEYS {
+                assigned += tx
+                    .execute(
+                        "INSERT OR IGNORE INTO app_state (key, value_json) \
+                         SELECT ?1 || ':user:' || ?2, value_json FROM app_state WHERE key = ?1",
+                        params![key, owner],
+                    )
+                    .map_err(sql_error)?;
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(assigned)
+        })
+        .await
+    }
+
     pub async fn authz_flag(&self, key: &str) -> Result<bool, String> {
         let key = format!("authz_flag:{key}");
         self.with_conn(move |conn| {

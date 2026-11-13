@@ -133,6 +133,8 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/admin/sessions/revoke", post(crate::routes::admin_audit::revoke_session))
         .route("/api/connection/list", get(crate::routes::connection::load_connections))
         .route("/api/database-backups", post(crate::routes::scheduled_backup::command))
+        .route("/api/history/save", post(crate::routes::history::save_history))
+        .route("/api/history/search", post(crate::routes::history::search_history))
         .route("/api/nacos/configs/get", post(|| async { "config" }))
         .route("/api/nacos/configs/publish", post(|| async { "published" }))
         .route("/api/etcd/compact", post(|| async { "compacted" }))
@@ -1092,4 +1094,41 @@ async fn non_sql_engines_require_the_operation_of_each_action() {
         call("/api/document-store/find-documents", ana.clone(), docs("billing")).await.status,
         StatusCode::FORBIDDEN
     );
+}
+
+#[tokio::test]
+async fn each_user_only_sees_their_own_query_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    state.app.authz.set_enforced(true);
+    state.app.storage.enable_user_scoped_data();
+    create_user(&state, "ana", "ana-password", false).await;
+    create_user(&state, "bob", "bob-password", false).await;
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let ana = server.login("ana", "ana-password").await.cookie.unwrap();
+    let bob = server.login("bob", "bob-password").await.cookie.unwrap();
+    let entry = |id: &str| {
+        json!({ "entry": {
+            "id": id, "connection_id": "c1", "connection_name": "Sales", "database": "crm",
+            "sql": format!("SELECT '{id}'"), "executed_at": format!("2026-01-01T00:00:0{}", id.len()),
+            "execution_time_ms": 1, "success": true, "error": null
+        } })
+    };
+    assert_eq!(server.post("/api/history/save", Some(&ana), entry("ana-1")).await.status, StatusCode::OK);
+    assert_eq!(server.post("/api/history/save", Some(&bob), entry("bob-12")).await.status, StatusCode::OK);
+    let overwrite = server.post("/api/history/save", Some(&bob), entry("ana-1")).await;
+    assert_ne!(overwrite.status, StatusCode::OK);
+
+    let ids = |reply: Reply| -> Vec<String> {
+        reply.body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ids(server.post("/api/history/search", Some(&ana), json!({})).await), vec!["ana-1"]);
+    assert_eq!(ids(server.post("/api/history/search", Some(&bob), json!({})).await), vec!["bob-12"]);
+    assert!(ids(server.post("/api/history/search", Some(&admin), json!({})).await).is_empty());
 }

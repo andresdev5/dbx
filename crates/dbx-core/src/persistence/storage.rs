@@ -67,6 +67,9 @@ mod credential_reset;
 pub use credential_reset::{CredentialResetFailure, CredentialResetPreparation, CredentialResetReport};
 #[path = "key_rotation.rs"]
 mod key_rotation;
+#[cfg(test)]
+#[path = "storage/user_data_tests.rs"]
+mod user_data_tests;
 pub use key_rotation::KeyRotationReport;
 
 const SSH_TUNNEL_SECRET_PREFIX: &str = "ssh_tunnels.";
@@ -277,6 +280,7 @@ pub fn maybe_import_user_data_db(
 #[derive(Clone)]
 pub struct Storage {
     db: SqliteHandle,
+    user_scoped_data: Arc<std::sync::atomic::AtomicBool>,
     /// Path to the SQLite database file (`dbx.db`). Its parent directory is the
     /// application data dir where dbx-managed state (e.g. `known_hosts`) lives.
     path: PathBuf,
@@ -1588,6 +1592,7 @@ impl Storage {
         let db = connect_path_create_if_missing(&db_path).await?;
         let storage = Self {
             db,
+            user_scoped_data: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             path,
             secret_key_policy: SecretKeyPolicy::PlatformDefault,
             secret_key_creation_allowed: true,
@@ -1611,6 +1616,21 @@ impl Storage {
         restrict_db_file_permissions(&storage.path);
         schema?;
         Ok(storage)
+    }
+
+    pub fn enable_user_scoped_data(&self) {
+        self.user_scoped_data.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn data_scope(&self) -> crate::persistence::data_scope::DataScope {
+        use crate::persistence::data_scope::{current_task_scope, DataScope};
+        if !self.user_scoped_data.load(std::sync::atomic::Ordering::Acquire) {
+            return DataScope::Shared;
+        }
+        match current_task_scope() {
+            Some(DataScope::Shared) | None => DataScope::Nobody,
+            Some(scope) => scope,
+        }
     }
 
     pub fn with_secret_key_policy(mut self, policy: SecretKeyPolicy) -> Self {
@@ -2717,6 +2737,7 @@ impl Storage {
                 migrate_legacy_connection_config_json_sync(conn, codec)?;
             }
             ensure_saved_sql_columns_sync(conn)?;
+            ensure_user_owner_columns_sync(conn)?;
             ensure_tab_runtime_cache_columns_sync(conn)?;
             ensure_schema_cache_columns_sync(conn)?;
             ensure_ai_configs_columns_sync(conn)?;
@@ -3372,6 +3393,7 @@ fn ensure_history_columns_sync(conn: &Connection) -> Result<(), String> {
         ("mcp_request_json", "TEXT"),
         ("mcp_response_json", "TEXT"),
         ("mcp_session_id", "TEXT"),
+        ("owner_user_id", "TEXT"),
     ];
 
     let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('history')").map_err(|e| e.to_string())?;
@@ -3397,29 +3419,57 @@ fn ensure_history_columns_sync(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_history_source_time ON history(source, executed_at DESC, id DESC);
-         CREATE INDEX IF NOT EXISTS idx_history_mcp_tool_time ON history(mcp_tool_name, executed_at DESC);",
+         CREATE INDEX IF NOT EXISTS idx_history_mcp_tool_time ON history(mcp_tool_name, executed_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_history_owner_time ON history(owner_user_id, executed_at DESC, id DESC);",
     )
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
+fn ensure_not_foreign(conn: &Connection, table: &str, id: &str, filter: &str) -> Result<(), String> {
+    let foreign: bool = conn
+        .query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?1 AND NOT ({filter}))"), [id], |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    if foreign {
+        return Err(format!("{table} entry belongs to another user"));
+    }
+    Ok(())
+}
+
+fn ensure_user_owner_columns_sync(conn: &Connection) -> Result<(), String> {
+    const OWNER: &[(&str, &str)] = &[("owner_user_id", "TEXT")];
+    ensure_table_columns(conn, "ai_conversations", OWNER)?;
+    ensure_table_columns(conn, "tab_runtime_cache", OWNER)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_ai_conversations_owner ON ai_conversations(owner_user_id, updated_at);
+         CREATE INDEX IF NOT EXISTS idx_tab_runtime_cache_owner_user ON tab_runtime_cache(owner_user_id);",
+    )
+    .map_err(|e| e.to_string())
+}
+
 fn ensure_saved_sql_columns_sync(conn: &Connection) -> Result<(), String> {
     const FOLDER_COLUMNS: &[(&str, &str)] =
-        &[("parent_folder_id", "TEXT"), ("order_index", "INTEGER NOT NULL DEFAULT 0")];
+        &[("parent_folder_id", "TEXT"), ("order_index", "INTEGER NOT NULL DEFAULT 0"), ("owner_user_id", "TEXT")];
     const FILE_COLUMNS: &[(&str, &str)] = &[
         ("is_default_query", "INTEGER NOT NULL DEFAULT 0"),
         ("catalog_name", "TEXT"),
         ("order_index", "INTEGER NOT NULL DEFAULT 0"),
         ("open_count", "INTEGER NOT NULL DEFAULT 0"),
         ("opened_at", "TEXT"),
+        ("owner_user_id", "TEXT"),
     ];
 
     ensure_table_columns(conn, "saved_sql_folders", FOLDER_COLUMNS)?;
     ensure_table_columns(conn, "saved_sql_files", FILE_COLUMNS)?;
     conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_sql_default_scope
-         ON saved_sql_files(connection_id, COALESCE(catalog_name, ''), database_name)
-         WHERE is_default_query = 1;",
+        "DROP INDEX IF EXISTS idx_saved_sql_default_scope;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_sql_default_owner_scope
+         ON saved_sql_files(COALESCE(owner_user_id, ''), connection_id, COALESCE(catalog_name, ''), database_name)
+         WHERE is_default_query = 1;
+         CREATE INDEX IF NOT EXISTS idx_saved_sql_files_owner ON saved_sql_files(owner_user_id);
+         CREATE INDEX IF NOT EXISTS idx_saved_sql_folders_owner ON saved_sql_folders(owner_user_id);",
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -3991,9 +4041,21 @@ fn normalized_setting_id(value: &str, label: &str) -> Result<String, String> {
 impl Storage {
     pub async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
         let entry = entry.clone();
+        let scope = self.data_scope();
         self.with_conn(move |conn| {
             let tx =
                 conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            let foreign: bool = tx
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM history WHERE id = ?1 AND NOT ({}))", scope.owner_filter()),
+                    [&entry.id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if foreign {
+                return Err("History entry belongs to another user".to_string());
+            }
+            let owner = scope.owner().map(str::to_string);
             let source = if entry.source.is_empty() { "sql" } else { entry.source.as_str() };
             let limit = if source == "mcp" {
                 load_mcp_history_retention_limit_from_conn(&tx)?
@@ -4003,8 +4065,8 @@ impl Storage {
             tx.execute(
                 "INSERT OR REPLACE INTO history \
                  (id, connection_name, database, sql_text, executed_at, execution_time_ms, success, error, \
-                  activity_kind, connection_id, operation, target, affected_rows, rollback_sql, details_json, source, mcp_tool_name, mcp_request_json, mcp_response_json, mcp_session_id) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  activity_kind, connection_id, operation, target, affected_rows, rollback_sql, details_json, source, mcp_tool_name, mcp_request_json, mcp_response_json, mcp_session_id, owner_user_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     entry.id,
                     entry.connection_name,
@@ -4021,16 +4083,18 @@ impl Storage {
                     entry.affected_rows,
                     entry.rollback_sql,
                     entry.details_json,
-                    source, entry.mcp_tool_name, entry.mcp_request_json, entry.mcp_response_json, entry.mcp_session_id
+                    source, entry.mcp_tool_name, entry.mcp_request_json, entry.mcp_response_json, entry.mcp_session_id,
+                    owner
                 ],
             )
             .map_err(|e| e.to_string())?;
 
             if limit != 0 {
                 tx.execute(
-                    "DELETE FROM history WHERE source = ?2 AND id NOT IN \
-                     (SELECT id FROM history WHERE source = ?2 ORDER BY executed_at DESC, id DESC LIMIT ?1)",
-                    rusqlite::params![i64::from(limit), source],
+                    "DELETE FROM history WHERE source = ?2 AND owner_user_id IS ?3 AND id NOT IN \
+                     (SELECT id FROM history WHERE source = ?2 AND owner_user_id IS ?3 \
+                      ORDER BY executed_at DESC, id DESC LIMIT ?1)",
+                    rusqlite::params![i64::from(limit), source, owner],
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -4045,6 +4109,7 @@ impl Storage {
         offset: usize,
         activity_kind: Option<String>,
     ) -> Result<Vec<HistoryEntry>, String> {
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
             let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<HistoryEntry> {
                 Ok(HistoryEntry {
@@ -4076,11 +4141,11 @@ impl Storage {
 
             if let Some(kind) = activity_kind {
                 let mut stmt = conn
-                    .prepare(
+                    .prepare(&format!(
                         "SELECT id, connection_name, database, sql_text, executed_at, execution_time_ms, success, \
                          error, activity_kind, connection_id, operation, target, affected_rows, rollback_sql, details_json, source, mcp_tool_name, mcp_request_json, mcp_response_json, mcp_session_id \
-                         FROM history WHERE activity_kind = ?1 ORDER BY executed_at DESC LIMIT ?2 OFFSET ?3",
-                    )
+                         FROM history WHERE activity_kind = ?1 AND {filter} ORDER BY executed_at DESC LIMIT ?2 OFFSET ?3",
+                    ))
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
                     .query_map(params![kind, limit as i64, offset as i64], map_row)
@@ -4088,11 +4153,11 @@ impl Storage {
                 rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
             } else {
                 let mut stmt = conn
-                    .prepare(
+                    .prepare(&format!(
                         "SELECT id, connection_name, database, sql_text, executed_at, execution_time_ms, success, \
                          error, activity_kind, connection_id, operation, target, affected_rows, rollback_sql, details_json, source, mcp_tool_name, mcp_request_json, mcp_response_json, mcp_session_id \
-                         FROM history ORDER BY executed_at DESC LIMIT ?1 OFFSET ?2",
-                    )
+                         FROM history WHERE {filter} ORDER BY executed_at DESC LIMIT ?1 OFFSET ?2",
+                    ))
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
                     .query_map(params![limit as i64, offset as i64], map_row)
@@ -4104,8 +4169,14 @@ impl Storage {
     }
 
     pub async fn search_history_entries(&self, request: HistorySearchRequest) -> Result<HistorySearchResult, String> {
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
-            let (predicate, values) = history_search_predicate(&request);
+            let (mut predicate, values) = history_search_predicate(&request);
+            if predicate.is_empty() {
+                predicate = format!(" WHERE {filter}");
+            } else {
+                predicate.push_str(&format!(" AND {filter}"));
+            }
             // Count before applying the cursor so the UI keeps the full filtered total.
             let count_sql = format!("SELECT COUNT(*) FROM history{predicate}");
             let total = conn
@@ -4156,12 +4227,13 @@ impl Storage {
     }
 
     pub async fn load_history_connection_options(&self) -> Result<Vec<HistoryConnectionOption>, String> {
-        self.with_conn(|conn| {
+        let filter = self.data_scope().owner_filter();
+        self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT connection_id, connection_name, database \
-                     FROM history ORDER BY executed_at DESC, id DESC",
-                )
+                     FROM history WHERE {filter} ORDER BY executed_at DESC, id DESC"
+                ))
                 .map_err(|error| error.to_string())?;
             let rows = stmt
                 .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
@@ -4194,7 +4266,11 @@ impl Storage {
     }
 
     pub async fn clear_history(&self) -> Result<(), String> {
-        self.with_conn(|conn| conn.execute("DELETE FROM history", []).map(|_| ()).map_err(|e| e.to_string())).await
+        let filter = self.data_scope().owner_filter();
+        self.with_conn(move |conn| {
+            conn.execute(&format!("DELETE FROM history WHERE {filter}"), []).map(|_| ()).map_err(|e| e.to_string())
+        })
+        .await
     }
 
     pub async fn clear_history_by_source(&self, source: &str) -> Result<(), String> {
@@ -4202,8 +4278,11 @@ impl Storage {
         if source.is_empty() {
             return Err("History source is required".to_string());
         }
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM history WHERE source = ?1", [source]).map(|_| ()).map_err(|e| e.to_string())
+            conn.execute(&format!("DELETE FROM history WHERE source = ?1 AND {filter}"), [source])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         })
         .await
     }
@@ -4215,8 +4294,9 @@ impl Storage {
                 return Ok(0);
             }
             conn.execute(
-                "DELETE FROM history WHERE source = 'mcp' AND id NOT IN \
-                 (SELECT id FROM history WHERE source = 'mcp' ORDER BY executed_at DESC, id DESC LIMIT ?1)",
+                "DELETE FROM history WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (\
+                 PARTITION BY owner_user_id ORDER BY executed_at DESC, id DESC) AS position \
+                 FROM history WHERE source = 'mcp') WHERE position > ?1)",
                 [i64::from(limit)],
             )
             .map(|count| count as u64)
@@ -4227,8 +4307,11 @@ impl Storage {
 
     pub async fn delete_history_entry(&self, id: &str) -> Result<(), String> {
         let id = id.to_string();
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM history WHERE id = ?1", [id]).map(|_| ()).map_err(|e| e.to_string())
+            conn.execute(&format!("DELETE FROM history WHERE id = ?1 AND {filter}"), [id])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         })
         .await
     }
@@ -6228,11 +6311,17 @@ impl Storage {
     }
 
     pub async fn save_saved_sql_editor_positions(&self, positions: &serde_json::Value) -> Result<(), String> {
-        self.save_app_state_value(APP_STATE_SAVED_SQL_EDITOR_POSITIONS_KEY, positions).await
+        match self.data_scope().app_state_key(APP_STATE_SAVED_SQL_EDITOR_POSITIONS_KEY) {
+            Some(key) => self.save_app_state_value(&key, positions).await,
+            None => Ok(()),
+        }
     }
 
     pub async fn load_saved_sql_editor_positions(&self) -> Result<Option<serde_json::Value>, String> {
-        self.load_app_state_value(APP_STATE_SAVED_SQL_EDITOR_POSITIONS_KEY).await
+        match self.data_scope().app_state_key(APP_STATE_SAVED_SQL_EDITOR_POSITIONS_KEY) {
+            Some(key) => self.load_app_state_value(&key).await,
+            None => Ok(None),
+        }
     }
 
     /// Persist the saved data-transfer task library (folders + task configs) as
@@ -6708,26 +6797,28 @@ fn prune_terminal_ai_runs(tx: &Transaction<'_>) -> Result<(), String> {
 }
 
 fn prune_ai_conversations(tx: &Transaction<'_>) -> Result<(), String> {
-    // The 50-row limit is a soft cap: conversations with active or actionable
-    // runs remain reachable even when they exceed the cap. Only terminal,
-    // unprotected conversations compete for the remaining budget.
+    // The 50-row limit is a soft cap per owner: conversations with active or
+    // actionable runs remain reachable even when they exceed the cap. Only
+    // terminal, unprotected conversations compete for the remaining budget.
     tx.execute(
         "WITH protected AS (
              SELECT DISTINCT conversation_id FROM ai_runs
              WHERE status IN ('preparing', 'queued', 'running', 'awaiting_write_confirmation', 'pending_recoverable')
-         ), budget AS (
-             SELECT MAX(0, 50 - COUNT(*)) AS value FROM protected
-         ), keepers AS (
-             SELECT conversation_id AS id FROM protected
-             UNION
-             SELECT id FROM (
-                 SELECT id FROM ai_conversations
-                 WHERE id NOT IN (SELECT conversation_id FROM protected)
-                 ORDER BY updated_at DESC
-                 LIMIT (SELECT value FROM budget)
-             )
+         ), budgets AS (
+             SELECT owner_user_id AS owner, MAX(0, 50 - COUNT(*)) AS value
+             FROM ai_conversations WHERE id IN (SELECT conversation_id FROM protected)
+             GROUP BY owner_user_id
+         ), ranked AS (
+             SELECT id, owner_user_id AS owner,
+                    ROW_NUMBER() OVER (PARTITION BY owner_user_id ORDER BY updated_at DESC) AS position
+             FROM ai_conversations
+             WHERE id NOT IN (SELECT conversation_id FROM protected)
          )
-         DELETE FROM ai_conversations WHERE id NOT IN (SELECT id FROM keepers)",
+         DELETE FROM ai_conversations WHERE id IN (
+             SELECT ranked.id FROM ranked
+             LEFT JOIN budgets ON budgets.owner IS ranked.owner
+             WHERE ranked.position > COALESCE(budgets.value, 50)
+         )",
         [],
     )
     .map_err(|e| e.to_string())?;
@@ -6745,12 +6836,14 @@ impl Storage {
     pub async fn save_ai_conversation(&self, conv: &AiConversation) -> Result<(), String> {
         let conv = conv.clone();
         let messages_json = serde_json::to_string(&conv.messages).map_err(|e| e.to_string())?;
+        let scope = self.data_scope();
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
+            ensure_not_foreign(&tx, "ai_conversations", &conv.id, &scope.owner_filter())?;
             tx.execute(
                 "INSERT INTO ai_conversations \
-                 (id, title, connection_name, connection_id, database, schema_name, messages_json, queued_input, created_at, updated_at, plugin_context_json, assistant_mode, assistant_action) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, title, connection_name, connection_id, database, schema_name, messages_json, queued_input, created_at, updated_at, plugin_context_json, assistant_mode, assistant_action, owner_user_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                    title = excluded.title, \
                    connection_name = excluded.connection_name, \
@@ -6775,7 +6868,8 @@ impl Storage {
                     conv.updated_at,
                     conv.plugin_context.map(|value| value.to_string()),
                     conv.assistant_mode,
-                    conv.assistant_action
+                    conv.assistant_action,
+                    scope.owner()
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -6787,12 +6881,13 @@ impl Storage {
     }
 
     pub async fn load_ai_conversations(&self) -> Result<Vec<AiConversation>, String> {
-        self.with_conn(|conn| {
+        let filter = self.data_scope().owner_filter();
+        self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT id, title, connection_name, database, messages_json, queued_input, created_at, updated_at, plugin_context_json, connection_id, schema_name, assistant_mode, assistant_action \
-                     FROM ai_conversations ORDER BY updated_at DESC",
-                )
+                     FROM ai_conversations WHERE {filter} ORDER BY updated_at DESC"
+                ))
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |row| {
@@ -6823,8 +6918,19 @@ impl Storage {
 
     pub async fn delete_ai_conversation(&self, id: &str) -> Result<(), String> {
         let id = id.to_string();
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let visible: bool = tx
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM ai_conversations WHERE id = ?1 AND {filter})"),
+                    [&id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !visible {
+                return Ok(());
+            }
             tx.execute("DELETE FROM ai_runs WHERE conversation_id = ?1", [&id]).map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM ai_conversations WHERE id = ?1", [&id]).map_err(|e| e.to_string())?;
             prune_ai_conversations(&tx)?;
@@ -6838,8 +6944,19 @@ impl Storage {
         let session_ids_json = serde_json::to_string(&run.session_ids).map_err(|e| e.to_string())?;
         let pending_confirmation_json = run.pending_confirmation.map(|value| value.to_string());
         let fifo_category = run.fifo_category.map(|c| c.as_str().to_string());
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let visible: bool = tx
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM ai_conversations WHERE id = ?1 AND {filter})"),
+                    [&run.conversation_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !visible {
+                return Err("AI conversation not found".to_string());
+            }
             tx.execute(
                 "INSERT OR REPLACE INTO ai_runs
                  (run_id, conversation_id, session_ids_json, status, connection_id, database, schema_name,
@@ -6875,12 +6992,14 @@ impl Storage {
         let session_ids_json = serde_json::to_string(&run.session_ids).map_err(|e| e.to_string())?;
         let pending_confirmation_json = run.pending_confirmation.map(|value| value.to_string());
         let fifo_category = run.fifo_category.map(|c| c.as_str().to_string());
+        let scope = self.data_scope();
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
+            ensure_not_foreign(&tx, "ai_conversations", &conv.id, &scope.owner_filter())?;
             tx.execute(
                 "INSERT INTO ai_conversations
-                 (id, title, connection_name, connection_id, database, schema_name, messages_json, queued_input, created_at, updated_at, plugin_context_json, assistant_mode, assistant_action)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 (id, title, connection_name, connection_id, database, schema_name, messages_json, queued_input, created_at, updated_at, plugin_context_json, assistant_mode, assistant_action, owner_user_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET
                    title = excluded.title,
                    connection_name = excluded.connection_name,
@@ -6905,7 +7024,8 @@ impl Storage {
                     conv.updated_at,
                     conv.plugin_context.map(|value| value.to_string()),
                     conv.assistant_mode,
-                    conv.assistant_action
+                    conv.assistant_action,
+                    scope.owner()
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -6938,13 +7058,16 @@ impl Storage {
     }
 
     pub async fn load_ai_runs(&self) -> Result<Vec<AiRun>, String> {
-        self.with_conn(|conn| {
+        let filter = self.data_scope().owner_filter();
+        self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT run_id, conversation_id, session_ids_json, status, connection_id, database,
                             schema_name, pending_confirmation_json, fifo_category, pending_input, max_seq, created_at, updated_at
-                     FROM ai_runs ORDER BY updated_at DESC",
-                )
+                     FROM ai_runs
+                     WHERE conversation_id IN (SELECT id FROM ai_conversations WHERE {filter})
+                     ORDER BY updated_at DESC"
+                ))
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |row| {
@@ -7458,6 +7581,7 @@ impl Storage {
                 || plan.tunnel_secret_profiles.is_some()
                 || plan.ai_configs.is_some();
         let codec = self.secret_codec_for_write(needs_key).await?;
+        let scope = self.data_scope();
         self.with_conn(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
 
@@ -7484,7 +7608,7 @@ impl Storage {
                     serde_json::from_str(&pinned).map_err(|e| e.to_string())?,
                 )?;
             }
-            apply_saved_sql_in_tx(&tx, &plan.saved_sql, plan.merge_saved_sql)?;
+            apply_saved_sql_in_tx(&tx, &plan.saved_sql, plan.merge_saved_sql, &scope)?;
             apply_desktop_settings_in_tx(&tx, &plan.desktop_settings, plan.desktop_settings_keys.as_deref())?;
             if let Some(editor_settings) = &plan.editor_settings {
                 let mut value = editor_settings.clone();
@@ -8457,15 +8581,19 @@ impl Storage {
 impl Storage {
     pub async fn replace_saved_sql_library(&self, library: &SavedSqlLibrary) -> Result<(), String> {
         let library = library.clone();
+        let scope = self.data_scope();
         self.with_conn(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM saved_sql_files", []).map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM saved_sql_folders", []).map_err(|e| e.to_string())?;
+            let filter = scope.owner_filter();
+            let owner = scope.owner().map(str::to_string);
+            tx.execute(&format!("DELETE FROM saved_sql_files WHERE {filter}"), []).map_err(|e| e.to_string())?;
+            tx.execute(&format!("DELETE FROM saved_sql_folders WHERE {filter}"), []).map_err(|e| e.to_string())?;
 
             for folder in &library.folders {
+                ensure_not_foreign(&tx, "saved_sql_folders", &folder.id, &filter)?;
                 tx.execute(
-                    "INSERT INTO saved_sql_folders (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO saved_sql_folders (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at, owner_user_id) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         folder.id,
                         folder.connection_id,
@@ -8473,17 +8601,19 @@ impl Storage {
                         folder.name,
                         folder.order_index,
                         folder.created_at,
-                        folder.updated_at
+                        folder.updated_at,
+                        owner
                     ],
                 )
                 .map_err(|e| e.to_string())?;
             }
 
             for file in &library.files {
+                ensure_not_foreign(&tx, "saved_sql_files", &file.id, &filter)?;
                 tx.execute(
                     "INSERT INTO saved_sql_files \
-                     (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query, owner_user_id) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         file.id,
                         file.connection_id,
@@ -8498,7 +8628,8 @@ impl Storage {
                         file.opened_at,
                         file.created_at,
                         file.updated_at,
-                        file.is_default_query
+                        file.is_default_query,
+                        owner
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -8510,12 +8641,13 @@ impl Storage {
     }
 
     pub async fn load_saved_sql_library(&self) -> Result<SavedSqlLibrary, String> {
-        self.with_conn(|conn| {
+        let filter = self.data_scope().owner_filter();
+        self.with_conn(move |conn| {
             let mut folder_stmt = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT id, connection_id, parent_folder_id, name, order_index, created_at, updated_at \
-                     FROM saved_sql_folders ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
-                )
+                     FROM saved_sql_folders WHERE {filter} ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE"
+                ))
                 .map_err(|e| e.to_string())?;
             let folders = folder_stmt
                 .query_map([], |row| {
@@ -8534,10 +8666,10 @@ impl Storage {
                 .map_err(|e| e.to_string())?;
 
             let mut file_stmt = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query \
-                     FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
-                )
+                     FROM saved_sql_files WHERE {filter} ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE"
+                ))
                 .map_err(|e| e.to_string())?;
             let files = file_stmt
                 .query_map([], |row| {
@@ -8569,12 +8701,13 @@ impl Storage {
     }
 
     pub async fn load_saved_sql_files_for_sync(&self) -> Result<Vec<SavedSqlFile>, String> {
-        self.with_conn(|conn| {
+        let filter = self.data_scope().owner_filter();
+        self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query \
-                     FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
-                )
+                     FROM saved_sql_files WHERE {filter} ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE"
+                ))
                 .map_err(|e| e.to_string())?;
             let files = stmt
                 .query_map([], |row| {
@@ -8605,12 +8738,13 @@ impl Storage {
     }
 
     pub async fn load_saved_sql_library_summary(&self) -> Result<SavedSqlLibrary, String> {
-        self.with_conn(|conn| {
+        let filter = self.data_scope().owner_filter();
+        self.with_conn(move |conn| {
             let mut folder_stmt = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT id, connection_id, parent_folder_id, name, order_index, created_at, updated_at \
-                     FROM saved_sql_folders ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
-                )
+                     FROM saved_sql_folders WHERE {filter} ORDER BY COALESCE(parent_folder_id, ''), order_index, connection_id, name COLLATE NOCASE"
+                ))
                 .map_err(|e| e.to_string())?;
             let folders = folder_stmt
                 .query_map([], |row| {
@@ -8629,10 +8763,10 @@ impl Storage {
                 .map_err(|e| e.to_string())?;
 
             let mut file_stmt = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, order_index, open_count, opened_at, created_at, updated_at, is_default_query \
-                     FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
-                )
+                     FROM saved_sql_files WHERE {filter} ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE"
+                ))
                 .map_err(|e| e.to_string())?;
             let files = file_stmt
                 .query_map([], |row| {
@@ -8665,12 +8799,13 @@ impl Storage {
 
     pub async fn load_saved_sql_file(&self, id: &str) -> Result<Option<SavedSqlFile>, String> {
         let id = id.to_string();
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query \
-                     FROM saved_sql_files WHERE id = ?1",
-                )
+                     FROM saved_sql_files WHERE id = ?1 AND {filter}"
+                ))
                 .map_err(|e| e.to_string())?;
             match stmt.query_row([id], |row| {
                 Ok(SavedSqlFile {
@@ -8701,10 +8836,12 @@ impl Storage {
 
     pub async fn save_saved_sql_folder(&self, folder: &SavedSqlFolder) -> Result<(), String> {
         let folder = folder.clone();
+        let scope = self.data_scope();
         self.with_conn(move |conn| {
+            ensure_not_foreign(conn, "saved_sql_folders", &folder.id, &scope.owner_filter())?;
             conn.execute(
-                "INSERT INTO saved_sql_folders (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO saved_sql_folders (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at, owner_user_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
                  parent_folder_id = excluded.parent_folder_id, \
@@ -8718,7 +8855,8 @@ impl Storage {
                     folder.name,
                     folder.order_index,
                     folder.created_at,
-                    folder.updated_at
+                    folder.updated_at,
+                    scope.owner()
                 ],
             )
             .map(|_| ())
@@ -8729,14 +8867,25 @@ impl Storage {
 
     pub async fn delete_saved_sql_folder(&self, id: &str) -> Result<(), String> {
         let id = id.to_string();
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            let visible: bool = tx
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM saved_sql_folders WHERE id = ?1 AND {filter})"),
+                    [id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !visible {
+                return Ok(());
+            }
             let mut folder_ids = vec![id.clone()];
             let mut index = 0;
             while index < folder_ids.len() {
                 let parent_id = folder_ids[index].clone();
                 let mut stmt = tx
-                    .prepare("SELECT id FROM saved_sql_folders WHERE parent_folder_id = ?1")
+                    .prepare(&format!("SELECT id FROM saved_sql_folders WHERE parent_folder_id = ?1 AND {filter}"))
                     .map_err(|e| e.to_string())?;
                 let child_ids = stmt
                     .query_map([parent_id.as_str()], |row| row.get::<_, String>(0))
@@ -8747,9 +8896,12 @@ impl Storage {
                 index += 1;
             }
             for folder_id in folder_ids.iter().rev() {
-                tx.execute("DELETE FROM saved_sql_files WHERE folder_id = ?1", [folder_id.as_str()])
-                    .map_err(|e| e.to_string())?;
-                tx.execute("DELETE FROM saved_sql_folders WHERE id = ?1", [folder_id.as_str()])
+                tx.execute(
+                    &format!("DELETE FROM saved_sql_files WHERE folder_id = ?1 AND {filter}"),
+                    [folder_id.as_str()],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(&format!("DELETE FROM saved_sql_folders WHERE id = ?1 AND {filter}"), [folder_id.as_str()])
                     .map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())
@@ -8759,11 +8911,13 @@ impl Storage {
 
     pub async fn save_saved_sql_file(&self, file: &SavedSqlFile) -> Result<(), String> {
         let file = file.clone();
+        let scope = self.data_scope();
         self.with_conn(move |conn| {
+            ensure_not_foreign(conn, "saved_sql_files", &file.id, &scope.owner_filter())?;
             conn.execute(
                 "INSERT INTO saved_sql_files \
-                 (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query, owner_user_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?16) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
                  folder_id = excluded.folder_id, \
@@ -8792,7 +8946,8 @@ impl Storage {
                     file.created_at,
                     file.updated_at,
                     file.is_default_query,
-                    file.sql_loaded
+                    file.sql_loaded,
+                    scope.owner()
                 ],
             )
             .map(|_| ())
@@ -8805,10 +8960,14 @@ impl Storage {
     /// overwritten, and a deleted default query must never be recreated here.
     pub async fn save_default_query_content(&self, id: &str, sql: &str, updated_at: &str) -> Result<(), String> {
         let (id, sql, updated_at) = (id.to_string(), sql.to_string(), updated_at.to_string());
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
             let changed = conn
                 .execute(
-                    "UPDATE saved_sql_files SET sql_text = ?2, updated_at = ?3 WHERE id = ?1 AND is_default_query = 1",
+                    &format!(
+                        "UPDATE saved_sql_files SET sql_text = ?2, updated_at = ?3 \
+                         WHERE id = ?1 AND is_default_query = 1 AND {filter}"
+                    ),
                     params![id, sql, updated_at],
                 )
                 .map_err(|e| e.to_string())?;
@@ -8822,8 +8981,11 @@ impl Storage {
 
     pub async fn delete_saved_sql_file(&self, id: &str) -> Result<(), String> {
         let id = id.to_string();
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM saved_sql_files WHERE id = ?1", [id]).map(|_| ()).map_err(|e| e.to_string())
+            conn.execute(&format!("DELETE FROM saved_sql_files WHERE id = ?1 AND {filter}"), [id])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         })
         .await
     }
@@ -9369,16 +9531,30 @@ impl Storage {
         let key = key.to_string();
         let byte_size = payload.len() as i64;
         let now = unix_timestamp_millis();
+        let scope = self.data_scope();
         self.with_conn(move |conn| {
+            let foreign: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM tab_runtime_cache WHERE cache_key = ?1 AND NOT ({}))",
+                        scope.owner_filter()
+                    ),
+                    [&key],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if foreign {
+                return Err("Tab cache entry belongs to another user".to_string());
+            }
             conn.execute(
                 "INSERT INTO tab_runtime_cache \
-                 (cache_key, payload, row_count, column_count, byte_size, updated_at, created_at, last_accessed_at, owner_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6, ?6, ?7) \
+                 (cache_key, payload, row_count, column_count, byte_size, updated_at, created_at, last_accessed_at, owner_id, owner_user_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6, ?6, ?7, ?8) \
                  ON CONFLICT(cache_key) DO UPDATE SET \
                  payload = excluded.payload, row_count = excluded.row_count, column_count = excluded.column_count, \
                  byte_size = excluded.byte_size, updated_at = excluded.updated_at, \
                  last_accessed_at = excluded.last_accessed_at, owner_id = excluded.owner_id",
-                params![key, payload, row_count, column_count, byte_size, now, owner_id],
+                params![key, payload, row_count, column_count, byte_size, now, owner_id, scope.owner()],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -9389,11 +9565,14 @@ impl Storage {
     pub async fn load_tab_runtime_cache(&self, key: &str) -> Result<Option<TabRuntimeCacheEntry>, String> {
         let key = key.to_string();
         let now = unix_timestamp_millis();
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
             let entry = conn
                 .query_row(
-                "SELECT cache_key, payload, row_count, column_count, byte_size, updated_at, created_at, last_accessed_at, owner_id \
-                 FROM tab_runtime_cache WHERE cache_key = ?1",
+                &format!(
+                    "SELECT cache_key, payload, row_count, column_count, byte_size, updated_at, created_at, last_accessed_at, owner_id \
+                     FROM tab_runtime_cache WHERE cache_key = ?1 AND {filter}"
+                ),
                 [&key],
                 |row| {
                     Ok(TabRuntimeCacheEntry {
@@ -9424,12 +9603,13 @@ impl Storage {
     }
 
     pub async fn list_tab_runtime_cache_metadata(&self) -> Result<Vec<TabRuntimeCacheMetadata>, String> {
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
             let mut statement = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT cache_key, row_count, column_count, byte_size, updated_at, created_at, last_accessed_at, owner_id \
-                     FROM tab_runtime_cache ORDER BY last_accessed_at ASC, cache_key ASC",
-                )
+                     FROM tab_runtime_cache WHERE {filter} ORDER BY last_accessed_at ASC, cache_key ASC"
+                ))
                 .map_err(|e| e.to_string())?;
             let metadata = statement
                 .query_map([], |row| {
@@ -9460,13 +9640,14 @@ impl Storage {
         max_age_ms: Option<i64>,
     ) -> Result<TabRuntimeCachePruneResult, String> {
         let now = unix_timestamp_millis();
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
             let live_keys: HashSet<String> = live_keys.into_iter().collect();
             let mut statement = conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT cache_key, byte_size, created_at, last_accessed_at \
-                     FROM tab_runtime_cache ORDER BY last_accessed_at ASC, cache_key ASC",
-                )
+                     FROM tab_runtime_cache WHERE {filter} ORDER BY last_accessed_at ASC, cache_key ASC"
+                ))
                 .map_err(|e| e.to_string())?;
             let entries = statement
                 .query_map([], |row| {
@@ -9530,16 +9711,19 @@ impl Storage {
 
     pub async fn delete_tab_runtime_cache_owner(&self, owner_id: &str) -> Result<usize, String> {
         let owner_id = owner_id.to_string();
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM tab_runtime_cache WHERE owner_id = ?1", [owner_id]).map_err(|e| e.to_string())
+            conn.execute(&format!("DELETE FROM tab_runtime_cache WHERE owner_id = ?1 AND {filter}"), [owner_id])
+                .map_err(|e| e.to_string())
         })
         .await
     }
 
     pub async fn delete_tab_runtime_cache(&self, key: &str) -> Result<(), String> {
         let key = key.to_string();
+        let filter = self.data_scope().owner_filter();
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM tab_runtime_cache WHERE cache_key = ?1", [key])
+            conn.execute(&format!("DELETE FROM tab_runtime_cache WHERE cache_key = ?1 AND {filter}"), [key])
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         })
@@ -10145,7 +10329,14 @@ fn apply_desktop_settings_in_tx(
     .map_err(|e| e.to_string())
 }
 
-fn apply_saved_sql_in_tx(tx: &Transaction<'_>, library: &SavedSqlLibrary, merge_existing: bool) -> Result<(), String> {
+fn apply_saved_sql_in_tx(
+    tx: &Transaction<'_>,
+    library: &SavedSqlLibrary,
+    merge_existing: bool,
+    scope: &crate::persistence::data_scope::DataScope,
+) -> Result<(), String> {
+    let filter = scope.owner_filter();
+    let owner = scope.owner();
     let mut folder_ids = HashSet::with_capacity(library.folders.len());
     for folder in &library.folders {
         if !folder_ids.insert(folder.id.as_str()) {
@@ -10160,20 +10351,22 @@ fn apply_saved_sql_in_tx(tx: &Transaction<'_>, library: &SavedSqlLibrary, merge_
     }
 
     if !merge_existing {
-        tx.execute("DELETE FROM saved_sql_files", []).map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM saved_sql_folders", []).map_err(|e| e.to_string())?;
+        tx.execute(&format!("DELETE FROM saved_sql_files WHERE {filter}"), []).map_err(|e| e.to_string())?;
+        tx.execute(&format!("DELETE FROM saved_sql_folders WHERE {filter}"), []).map_err(|e| e.to_string())?;
     }
     for folder in &library.folders {
+        ensure_not_foreign(tx, "saved_sql_folders", &folder.id, &filter)?;
         tx.execute(
-            "INSERT OR REPLACE INTO saved_sql_folders (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![folder.id, folder.connection_id, folder.parent_folder_id, folder.name, folder.order_index, folder.created_at, folder.updated_at],
+            "INSERT OR REPLACE INTO saved_sql_folders (id, connection_id, parent_folder_id, name, order_index, created_at, updated_at, owner_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![folder.id, folder.connection_id, folder.parent_folder_id, folder.name, folder.order_index, folder.created_at, folder.updated_at, owner],
         )
         .map_err(|e| e.to_string())?;
     }
     for file in &library.files {
+        ensure_not_foreign(tx, "saved_sql_files", &file.id, &filter)?;
         tx.execute(
-            "INSERT INTO saved_sql_files (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET connection_id=excluded.connection_id, folder_id=excluded.folder_id, name=excluded.name, database_name=excluded.database_name, catalog_name=excluded.catalog_name, schema_name=excluded.schema_name, sql_text=excluded.sql_text, order_index=excluded.order_index, open_count=excluded.open_count, opened_at=excluded.opened_at, created_at=excluded.created_at, updated_at=excluded.updated_at, is_default_query=excluded.is_default_query",
-            params![file.id, file.connection_id, file.folder_id, file.name, file.database, file.catalog, file.schema, file.sql, file.order_index, file.open_count, file.opened_at, file.created_at, file.updated_at, file.is_default_query],
+            "INSERT INTO saved_sql_files (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at, is_default_query, owner_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET connection_id=excluded.connection_id, folder_id=excluded.folder_id, name=excluded.name, database_name=excluded.database_name, catalog_name=excluded.catalog_name, schema_name=excluded.schema_name, sql_text=excluded.sql_text, order_index=excluded.order_index, open_count=excluded.open_count, opened_at=excluded.opened_at, created_at=excluded.created_at, updated_at=excluded.updated_at, is_default_query=excluded.is_default_query",
+            params![file.id, file.connection_id, file.folder_id, file.name, file.database, file.catalog, file.schema, file.sql, file.order_index, file.open_count, file.opened_at, file.created_at, file.updated_at, file.is_default_query, owner],
         )
         .map_err(|e| e.to_string())?;
     }
