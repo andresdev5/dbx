@@ -3011,7 +3011,43 @@ pub async fn execute_sql_statement_with_options_typed(
         cancel_token,
         options,
     ));
-    executed.await.map(|(result, _)| result)
+    if !state.audit.is_enabled() {
+        return executed.await.map(|(result, _)| result);
+    }
+    let (outcome, pending) = crate::audit::track_statements(executed).await;
+    let result = outcome.map(|(result, _)| result);
+    if let Some(event_id) = pending.into_iter().next_back() {
+        state.audit.complete(match &result {
+            Ok(result) => {
+                crate::audit::StatementOutcome::succeeded(event_id, result.affected_rows, result.execution_time_ms)
+            }
+            Err(_) => crate::audit::StatementOutcome::failed(event_id, None),
+        });
+    }
+    result
+}
+
+fn report_multi_statement_outcomes(
+    state: &AppState,
+    pending: Vec<String>,
+    result: &Result<Vec<ExecuteMultiResult>, QueryExecutionError>,
+) {
+    match result {
+        Ok(results) if results.len() == pending.len() => {
+            for (event_id, item) in pending.into_iter().zip(results) {
+                state.audit.complete(if item.execution_error {
+                    crate::audit::StatementOutcome::failed(event_id, Some(item.result.execution_time_ms))
+                } else {
+                    crate::audit::StatementOutcome::succeeded(
+                        event_id,
+                        item.result.affected_rows,
+                        item.result.execution_time_ms,
+                    )
+                });
+            }
+        }
+        Ok(_) | Err(_) => {}
+    }
 }
 
 /// Boxed, type-erased run of one SQL statement, awaiting it without nesting
@@ -3989,7 +4025,7 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     // reconnection for a cold pool happens outside the statement dispatcher and
     // would otherwise be invisible while the loading indicator counts it.
     let request_start = std::time::Instant::now();
-    let result = execute_multi_core_with_options_for_client_and_progress_typed_inner(
+    let execution = Box::pin(execute_multi_core_with_options_for_client_and_progress_typed_inner(
         state,
         connection_id,
         database,
@@ -3998,8 +4034,14 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
         cancel_token,
         options,
         progress,
-    )
-    .await;
+    ));
+    let result = if state.audit.is_enabled() {
+        let (result, pending) = crate::audit::track_statements(execution).await;
+        report_multi_statement_outcomes(state, pending, &result);
+        result
+    } else {
+        execution.await
+    };
     if invalidate {
         crate::object_cache::invalidate_connection_object_cache(&state.storage, connection_id).await;
     }

@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
@@ -222,9 +224,61 @@ impl AuditEvent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementOutcome {
+    pub event_id: String,
+    pub rows_affected: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub failed: bool,
+}
+
+impl StatementOutcome {
+    pub fn succeeded(event_id: String, rows_affected: u64, duration_ms: u128) -> Self {
+        Self {
+            event_id,
+            rows_affected: Some(i64::try_from(rows_affected).unwrap_or(i64::MAX)),
+            duration_ms: Some(i64::try_from(duration_ms).unwrap_or(i64::MAX)),
+            failed: false,
+        }
+    }
+
+    pub fn failed(event_id: String, duration_ms: Option<u128>) -> Self {
+        Self {
+            event_id,
+            rows_affected: None,
+            duration_ms: duration_ms.map(|duration| i64::try_from(duration).unwrap_or(i64::MAX)),
+            failed: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum AuditMessage {
+    Insert(Box<AuditEvent>),
+    Complete(StatementOutcome),
+}
+
+tokio::task_local! {
+    static PENDING_STATEMENTS: RefCell<Vec<String>>;
+}
+
+pub fn note_pending_statement(event_id: &str) {
+    let _ = PENDING_STATEMENTS.try_with(|pending| pending.borrow_mut().push(event_id.to_string()));
+}
+
+pub async fn track_statements<T>(future: impl Future<Output = T>) -> (T, Vec<String>) {
+    PENDING_STATEMENTS
+        .scope(RefCell::new(Vec::new()), async move {
+            let output = future.await;
+            let pending = PENDING_STATEMENTS.with(|pending| pending.take());
+            (output, pending)
+        })
+        .await
+}
+
 #[derive(Default)]
 pub struct AuditLog {
-    sender: RwLock<Option<mpsc::Sender<AuditEvent>>>,
+    sender: RwLock<Option<mpsc::Sender<AuditMessage>>>,
     dropped: Arc<AtomicU64>,
     clients: RwLock<HashMap<String, String>>,
 }
@@ -256,11 +310,19 @@ impl AuditLog {
     }
 
     pub fn record(&self, event: AuditEvent) {
+        self.send(AuditMessage::Insert(Box::new(event)));
+    }
+
+    pub fn complete(&self, outcome: StatementOutcome) {
+        self.send(AuditMessage::Complete(outcome));
+    }
+
+    fn send(&self, message: AuditMessage) {
         let guard = read(&self.sender);
         let Some(sender) = guard.as_ref() else {
             return;
         };
-        if sender.try_send(event).is_err() {
+        if sender.try_send(message).is_err() {
             let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped.is_power_of_two() {
                 log::warn!("DBX audit queue is full; {dropped} events dropped so far");
@@ -300,14 +362,22 @@ impl AuditLog {
     }
 }
 
-async fn run_writer(storage: Storage, mut receiver: mpsc::Receiver<AuditEvent>, dropped: Arc<AtomicU64>) {
+async fn run_writer(storage: Storage, mut receiver: mpsc::Receiver<AuditMessage>, dropped: Arc<AtomicU64>) {
     let mut reported_drops = 0;
     while let Some(first) = receiver.recv().await {
-        let mut batch = vec![first];
-        while batch.len() < BATCH_SIZE {
+        let mut messages = vec![first];
+        while messages.len() < BATCH_SIZE {
             match receiver.try_recv() {
-                Ok(event) => batch.push(event),
+                Ok(message) => messages.push(message),
                 Err(_) => break,
+            }
+        }
+        let mut batch = Vec::with_capacity(messages.len());
+        let mut outcomes = Vec::new();
+        for message in messages {
+            match message {
+                AuditMessage::Insert(event) => batch.push(*event),
+                AuditMessage::Complete(outcome) => outcomes.push(outcome),
             }
         }
         let total_drops = dropped.load(Ordering::Relaxed);
@@ -321,6 +391,9 @@ async fn run_writer(storage: Storage, mut receiver: mpsc::Receiver<AuditEvent>, 
         }
         if let Err(error) = storage.insert_audit_events(batch).await {
             log::error!("DBX audit failed to write events: {error}");
+        }
+        if let Err(error) = storage.complete_audit_statements(outcomes).await {
+            log::error!("DBX audit failed to record statement outcomes: {error}");
         }
     }
 }

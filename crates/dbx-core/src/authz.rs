@@ -58,6 +58,9 @@ fn audit_decision(
     };
     if let Some(statement) = statement {
         record = record.statement(statement);
+        if decision.is_allowed() {
+            crate::audit::note_pending_statement(&record.event_id);
+        }
     }
     state.audit.record_in_request(record);
 }
@@ -721,6 +724,68 @@ mod tests {
         let connection = rows.iter().find(|row| row.event == "connection_denied").unwrap();
         assert_eq!(connection.user_id.as_deref(), Some("bob"));
         assert_eq!(connection.connection_id.as_deref(), Some(CONNECTION));
+    }
+
+    async fn sql_rows_with_outcome(state: &AppState, expected: usize) -> Vec<crate::persistence::storage::AuditEntry> {
+        for _ in 0..200 {
+            let rows: Vec<_> = audit_rows(state, 0)
+                .await
+                .into_iter()
+                .filter(|row| row.event == "sql" && (row.duration_ms.is_some() || row.reason.is_some()))
+                .collect();
+            if rows.len() >= expected {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("statement outcomes were not written");
+    }
+
+    #[tokio::test]
+    async fn audited_statements_record_rows_duration_and_failures() {
+        let (_root, state) = state(false).await;
+        state.audit.start(state.storage.clone(), None);
+        enforce(
+            &state,
+            vec![grant(
+                "w",
+                Subject::User("ana".into()),
+                Scope::Resource(Resource::connection(CONNECTION)),
+                Effect::Allow,
+                BuiltinRole::FullEditor.operations(),
+            )],
+            &[],
+        );
+        run_as(&state, "ana-token", "INSERT INTO orders(status) VALUES ('a'), ('b'), ('c')").await.unwrap();
+        run_as(&state, "ana-token", "UPDATE missing_table SET x = 1").await.unwrap_err();
+        let rows = sql_rows_with_outcome(&state, 2).await;
+        let insert = rows.iter().find(|row| row.operations == Some(Operations::INSERT)).unwrap();
+        assert_eq!(insert.rows_affected, Some(3));
+        assert!(insert.duration_ms.is_some());
+        assert_eq!(insert.reason, None);
+        let failed = rows.iter().find(|row| row.table_names.as_deref() == Some("missing_table")).unwrap();
+        assert_eq!(failed.decision.as_deref(), Some("allow"));
+        assert_eq!(failed.reason.as_deref(), Some("execution_failed"));
+        assert_eq!(failed.rows_affected, None);
+
+        with_credential_owner(
+            Some("ana-token".into()),
+            crate::query::execute_multi_core(
+                &state,
+                CONNECTION,
+                "main",
+                "UPDATE orders SET status = 'x' WHERE status = 'a'; DELETE FROM orders WHERE status <> 'x'",
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let rows = sql_rows_with_outcome(&state, 4).await;
+        let update = rows.iter().find(|row| row.operations == Some(Operations::UPDATE)).unwrap();
+        assert_eq!(update.rows_affected, Some(1));
+        let delete = rows.iter().find(|row| row.operations == Some(Operations::DELETE)).unwrap();
+        assert_eq!(delete.rows_affected, Some(2));
     }
 
     #[tokio::test]

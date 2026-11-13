@@ -37,6 +37,7 @@ export const AUDIT_EVENTS = [
   "audit_revealed",
   "audit_exported",
   "audit_events_dropped",
+  "secret_key_rotated",
 ] as const;
 
 export interface AuditEntry {

@@ -34,8 +34,8 @@ const SQL_EVENT = {
   decision: "deny",
   reason: "Permission denied: DELETE required on crm.orders",
   has_statement: true,
-  rows_affected: null,
-  duration_ms: null,
+  rows_affected: 4,
+  duration_ms: 12,
   detail: null,
 };
 const SYSTEM_EVENT = { ...SQL_EVENT, id: 6, event_id: "e-6", acting_principal: "system", task_id: "backup:run-1", username: null, user_id: null, decision: "allow", has_statement: false, operations: ["SELECT", "EXPORT"], event: "data_access" };
@@ -157,6 +157,8 @@ describe("audit panels", () => {
     await flush();
     const detail = byTestId(root, "audit-entry-detail");
     expect(detail.textContent).toContain("10.0.0.7");
+    expect(byTestId(detail, "audit-rows").textContent).toBe("4");
+    expect(detail.textContent).toContain('audit.durationMs:{"ms":12}');
     expect(detail.textContent).toContain("audit.statementEncrypted");
     expect(requests.some((request) => request.path === "admin/audit/reveal")).toBe(false);
     byTestId<HTMLButtonElement>(detail, "audit-reveal").click();

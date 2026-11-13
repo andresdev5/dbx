@@ -1077,6 +1077,9 @@ export default withEnglishFallback({
     reason: "Motivo",
     ip: "IP",
     session: "Sesión",
+    rowsAffected: "Filas afectadas",
+    duration: "Duración",
+    durationMs: "{ms} ms",
     eventId: "Id del evento",
     statementEncrypted: "SQL guardado cifrado",
     reveal: "Revelar SQL",
@@ -1121,6 +1124,7 @@ export default withEnglishFallback({
       audit_revealed: "SQL auditado revelado",
       audit_exported: "Auditoría exportada",
       audit_events_dropped: "Eventos de auditoría perdidos",
+      secret_key_rotated: "Clave de cifrado rotada",
     },
     errors: {
       filterInvalid: "Revisa los filtros: las fechas o la decisión no son válidas",

@@ -4,7 +4,7 @@ use dbx_authz::Operations;
 use rusqlite::Row;
 
 use super::{params, OptionalExtension, Storage};
-use crate::audit::{mask_sensitive_sql, AuditEvent, AUDIT_DIGEST_LABEL, AUDIT_NAMESPACE};
+use crate::audit::{mask_sensitive_sql, AuditEvent, StatementOutcome, AUDIT_DIGEST_LABEL, AUDIT_NAMESPACE};
 
 pub(super) const WEB_AUDIT_SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS audit_log (
@@ -216,6 +216,33 @@ impl Storage {
             }
             tx.commit().map_err(sql_error)?;
             Ok(count)
+        })
+        .await
+    }
+
+    pub async fn complete_audit_statements(&self, outcomes: Vec<StatementOutcome>) -> Result<usize, String> {
+        if outcomes.is_empty() {
+            return Ok(0);
+        }
+        self.with_conn(move |conn| {
+            let tx = conn.transaction().map_err(sql_error)?;
+            let mut updated = 0;
+            {
+                let mut update = tx
+                    .prepare(
+                        "UPDATE audit_log SET rows_affected = ?2, duration_ms = ?3, \
+                         reason = CASE WHEN ?4 THEN COALESCE(reason, 'execution_failed') ELSE reason END \
+                         WHERE event_id = ?1 AND event = 'sql' AND decision = 'allow'",
+                    )
+                    .map_err(sql_error)?;
+                for outcome in outcomes {
+                    updated += update
+                        .execute(params![outcome.event_id, outcome.rows_affected, outcome.duration_ms, outcome.failed])
+                        .map_err(sql_error)?;
+                }
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(updated)
         })
         .await
     }

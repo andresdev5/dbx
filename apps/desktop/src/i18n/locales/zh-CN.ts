@@ -1217,6 +1217,9 @@ export default withEnglishFallback({
     reason: "原因",
     ip: "IP",
     session: "会话",
+    rowsAffected: "影响行数",
+    duration: "耗时",
+    durationMs: "{ms} 毫秒",
     eventId: "事件 ID",
     statementEncrypted: "SQL 已加密保存",
     reveal: "查看 SQL",
@@ -1261,6 +1264,7 @@ export default withEnglishFallback({
       audit_revealed: "已查看审计 SQL",
       audit_exported: "已导出审计",
       audit_events_dropped: "审计事件丢失",
+      secret_key_rotated: "已轮换加密密钥",
     },
     errors: {
       filterInvalid: "请检查筛选条件：日期或结果无效",

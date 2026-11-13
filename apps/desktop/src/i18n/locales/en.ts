@@ -1281,6 +1281,9 @@ export default {
     reason: "Reason",
     ip: "IP",
     session: "Session",
+    rowsAffected: "Rows affected",
+    duration: "Duration",
+    durationMs: "{ms} ms",
     eventId: "Event id",
     statementEncrypted: "SQL stored encrypted",
     reveal: "Reveal SQL",
@@ -1325,6 +1328,7 @@ export default {
       audit_revealed: "Audited SQL revealed",
       audit_exported: "Audit exported",
       audit_events_dropped: "Audit events dropped",
+      secret_key_rotated: "Encryption key rotated",
     },
     errors: {
       filterInvalid: "Check the filters: the dates or the decision are not valid",

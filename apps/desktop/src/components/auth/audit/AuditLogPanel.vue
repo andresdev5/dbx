@@ -227,6 +227,14 @@ onMounted(async () => {
               <dt class="text-muted-foreground">{{ t("audit.session") }}</dt>
               <dd class="font-mono">{{ entry.session_ref }}</dd>
             </template>
+            <template v-if="entry.rows_affected !== null">
+              <dt class="text-muted-foreground">{{ t("audit.rowsAffected") }}</dt>
+              <dd data-testid="audit-rows">{{ entry.rows_affected }}</dd>
+            </template>
+            <template v-if="entry.duration_ms !== null">
+              <dt class="text-muted-foreground">{{ t("audit.duration") }}</dt>
+              <dd>{{ t("audit.durationMs", { ms: entry.duration_ms }) }}</dd>
+            </template>
             <dt class="text-muted-foreground">{{ t("audit.eventId") }}</dt>
             <dd class="font-mono">{{ entry.event_id }}</dd>
           </dl>
