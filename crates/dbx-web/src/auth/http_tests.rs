@@ -1435,3 +1435,64 @@ async fn oidc_single_sign_on_creates_links_and_rejects_accounts() {
     assert_eq!(server.login("ana.sso", "!external").await.status, StatusCode::UNAUTHORIZED);
     idp_task.abort();
 }
+
+#[tokio::test]
+async fn ldap_directory_accounts_sign_in_through_the_login_form() {
+    use crate::ldap::test_server;
+    let (ldap_address, _recorded, ldap_task) = test_server::spawn().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let saved = server
+        .post(
+            "/api/admin/identity-providers/save",
+            Some(&admin),
+            json!({
+                "kind": "ldap", "name": "Corporate LDAP", "auto_create_users": true, "secret": test_server::SERVICE_SECRET,
+                "config": { "url": format!("ldap://{ldap_address}"), "bind_dn": test_server::SERVICE_DN, "user_base_dn": test_server::BASE_DN }
+            }),
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+    let provider_id = saved.body["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        server.post("/api/admin/identity-providers/test", Some(&admin), json!({ "id": provider_id })).await.body["ok"],
+        true
+    );
+    let invalid = server
+        .post(
+            "/api/admin/identity-providers/save",
+            Some(&admin),
+            json!({ "kind": "ldap", "name": "Broken", "config": { "url": "ldap://ldap.example.com", "user_base_dn": "dc=x", "user_filter": "(uid=fixed)" } }),
+        )
+        .await;
+    assert_eq!(invalid.body["error"], "ldap_filter_invalid");
+
+    let login = |username: &'static str, password: &'static str, provider: Value| {
+        let server = &server;
+        async move {
+            server
+                .post(
+                    "/api/auth/login",
+                    None,
+                    json!({ "username": username, "password": password, "provider": provider }),
+                )
+                .await
+        }
+    };
+    let signed_in = login("ana", "ana-ldap", json!(provider_id)).await;
+    assert_eq!(signed_in.status, StatusCode::OK, "{:?}", signed_in.body);
+    assert_eq!(signed_in.body["user"]["username"], "ana");
+    let user = state.app.storage.find_web_user_by_username("ana").await.unwrap().unwrap();
+    assert_eq!(user.identity_provider, provider_id);
+    assert_eq!(user.display_name.as_deref(), Some("Ana López"));
+    assert_eq!(login("ana", "wrong", json!(provider_id)).await.body["error"], "invalid_credentials");
+    assert_eq!(login("ana", "ana-ldap", json!("local")).await.body["error"], "invalid_credentials");
+    assert_eq!(login("ana", "ana-ldap", json!("missing")).await.body["error"], "sso_provider_unknown");
+
+    ldap_task.abort();
+    let down = login("bob", "bob-ldap", json!(provider_id)).await;
+    assert_eq!(down.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(down.body["error"], "ldap_unavailable");
+}

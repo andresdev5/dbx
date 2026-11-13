@@ -101,7 +101,7 @@ pub struct CallbackQuery {
     pub error: Option<String>,
 }
 
-async fn resolve_user(
+pub(crate) async fn resolve_user(
     state: &WebState,
     provider: &IdentityProvider,
     subject: &str,
@@ -212,4 +212,59 @@ pub async fn oidc_callback(
         response.headers_mut().insert(header::LOCATION, location);
     }
     response
+}
+
+pub(crate) async fn ldap_login(
+    state: &WebState,
+    client: &ClientInfo,
+    provider_id: &str,
+    username: &str,
+    password: &str,
+) -> Response {
+    use crate::auth::{error_response, INVALID_CREDENTIALS};
+    use crate::state::LoginThrottle;
+
+    let provider = match state.app.storage.find_identity_provider(provider_id).await {
+        Ok(Some(provider)) if provider.enabled && provider.kind == "ldap" => provider,
+        _ => return error_response(StatusCode::BAD_REQUEST, "sso_provider_unknown"),
+    };
+    let user_key = LoginThrottle::user_key(username);
+    let ip_key = LoginThrottle::ip_key(client.ip);
+    let secret = state.app.storage.load_identity_provider_secret(&provider.id).await.unwrap_or(None);
+    let identity = match crate::ldap::authenticate(&provider.config, secret.as_deref(), username, password).await {
+        Ok(identity) => identity,
+        Err(crate::ldap::LdapFailure::InvalidCredentials) => {
+            let now = std::time::Instant::now();
+            {
+                let mut throttle = state.login_throttle.lock().await;
+                throttle.record_failure(&ip_key, now);
+                throttle.record_failure(&user_key, now);
+            }
+            audit_auth_failure(state, "login_failed", username, client, "invalid_credentials");
+            return error_response(StatusCode::UNAUTHORIZED, INVALID_CREDENTIALS);
+        }
+        Err(crate::ldap::LdapFailure::Unavailable(detail)) => {
+            log::warn!("LDAP sign-in with '{}' failed: {detail}", provider.name);
+            audit_auth_failure(state, "login_failed", username, client, "ldap_unavailable");
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "ldap_unavailable");
+        }
+    };
+    let user = match resolve_user(state, &provider, &identity.subject, Some(&identity.username), identity.display_name)
+        .await
+    {
+        Ok(user) => user,
+        Err(code) => {
+            audit_auth_failure(state, "login_failed", username, client, code);
+            return error_response(StatusCode::FORBIDDEN, code);
+        }
+    };
+    {
+        let mut throttle = state.login_throttle.lock().await;
+        throttle.clear(&ip_key);
+        throttle.clear(&user_key);
+    }
+    if user.mfa_enabled {
+        return crate::routes::mfa::issue_login_challenge(state, &user).await;
+    }
+    start_session(state, &user, client, "login_succeeded", false).await
 }

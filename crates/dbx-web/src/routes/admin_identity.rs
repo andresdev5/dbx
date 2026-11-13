@@ -98,6 +98,7 @@ pub fn validated_config(kind: &str, config: serde_json::Value) -> Result<serde_j
             config.validate()?;
             serde_json::to_value(config).map_err(|_| "identity_provider_config_invalid")
         }
+        "ldap" => crate::ldap::validated_config(config),
         _ => Err("identity_provider_kind_invalid"),
     }
 }
@@ -204,6 +205,12 @@ pub async fn test(
             }),
             None => Err("the stored configuration is not valid".to_string()),
         },
+        "ldap" => {
+            let secret = state.app.storage.load_identity_provider_secret(&provider.id).await.ok().flatten();
+            crate::ldap::test_connection(&provider.config, secret.as_deref())
+                .await
+                .map(|()| serde_json::json!({ "ok": true }))
+        }
         _ => Err("unknown provider kind".to_string()),
     };
     match result {

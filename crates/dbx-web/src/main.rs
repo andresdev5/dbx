@@ -8,6 +8,7 @@ mod demo;
 mod engine_access;
 mod error;
 mod identity;
+mod ldap;
 mod mfa;
 mod oidc;
 mod request_context;

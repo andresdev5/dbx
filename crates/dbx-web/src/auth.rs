@@ -39,6 +39,8 @@ pub struct LoginRequest {
     pub captcha_code: Option<String>,
     #[serde(default)]
     pub captcha_token: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -347,6 +349,10 @@ pub async fn login(State(state): State<Arc<WebState>>, client: ClientInfo, Json(
     if let Some(remaining) = locked_for {
         audit_auth_failure(&state, "login_failed", &body.username, &client, "rate_limited");
         return rate_limited(remaining);
+    }
+
+    if let Some(provider_id) = body.provider.as_deref().map(str::trim).filter(|id| !id.is_empty() && *id != "local") {
+        return crate::routes::sso::ldap_login(&state, &client, provider_id, &body.username, &body.password).await;
     }
 
     let user = match normalize_username(&body.username) {

@@ -55,6 +55,7 @@ sha1 = "0.10"
 hmac = "0.12"
 data-encoding = "2"
 jsonwebtoken = "9"
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-aws-lc-rs"] }
 tempfile = "3"
 rust-embed = { version = "8", features = ["debug-embed"], optional = true }
 mime_guess = { version = "2", optional = true }
