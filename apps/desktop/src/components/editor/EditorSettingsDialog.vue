@@ -31,6 +31,7 @@ import {
   Keyboard,
   Loader2,
   LogOut,
+  ShieldCheck,
   UserRound,
   Moon,
   PackageSearch,
@@ -354,13 +355,7 @@ import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import AppLogo from "@/components/icons/AppLogo.vue";
 import ChangelogPanel from "@/components/settings/ChangelogPanel.vue";
 import WebLoginCaptchaSetting from "@/components/settings/WebLoginCaptchaSetting.vue";
-import UserManagementPanel from "@/components/auth/UserManagementPanel.vue";
-import AccessControlPanel from "@/components/auth/access/AccessControlPanel.vue";
 import MfaAccountCard from "@/components/auth/mfa/MfaAccountCard.vue";
-import CaptchaProviderSetting from "@/components/auth/captcha/CaptchaProviderSetting.vue";
-import IdentityProvidersPanel from "@/components/auth/sso/IdentityProvidersPanel.vue";
-import AuditLogPanel from "@/components/auth/audit/AuditLogPanel.vue";
-import SessionsPanel from "@/components/auth/audit/SessionsPanel.vue";
 import SettingsTransferPanel from "@/components/settings/SettingsTransferPanel.vue";
 import McpCapabilityBrowser from "@/components/settings/McpCapabilityBrowser.vue";
 import McpPluginToolsModeSetting from "@/components/settings/McpPluginToolsModeSetting.vue";
@@ -613,6 +608,7 @@ const emit = defineEmits<{
   "open-update-center": [];
   "ai-config-deep-link-handled": [];
   logout: [];
+  "open-admin-console": [];
 }>();
 
 const hasAnyUpdate = computed(() => Boolean(props.appUpdateAvailable || (props.driverUpdateCount || 0) > 0 || props.jdbcUpdateAvailable || props.mcpUpdateAvailable || (props.pluginUpdateCount || 0) > 0));
@@ -14026,29 +14022,23 @@ LIMIT 100;</pre>
                 </p>
               </div>
 
-              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
-                <UserManagementPanel :current-user-id="signedInUser.id" />
+              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5" data-testid="settings-admin-console-card">
+                <div class="flex flex-wrap items-center gap-3 rounded-lg border border-border/70 bg-muted/20 p-4">
+                  <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-500/12 text-emerald-600 dark:text-emerald-400">
+                    <ShieldCheck class="h-4.5 w-4.5" />
+                  </span>
+                  <div class="min-w-0 flex-1 space-y-0.5">
+                    <p class="text-sm font-medium">{{ t("adminConsole.title") }}</p>
+                    <p class="text-xs text-muted-foreground">{{ t("adminConsole.settingsHint") }}</p>
+                  </div>
+                  <Button variant="outline" size="sm" data-testid="settings-open-admin-console" @click="emit('open-admin-console')">
+                    {{ t("adminConsole.open") }}
+                  </Button>
+                </div>
               </div>
 
-              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
-                <AccessControlPanel />
-              </div>
-
-              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
-                <IdentityProvidersPanel />
-              </div>
-
-              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
-                <SessionsPanel />
-              </div>
-
-              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
-                <AuditLogPanel />
-              </div>
-
-              <div v-if="!signedInUser || signedInUser.role === 'admin'" class="border-t border-border/60 pt-5 space-y-3">
+              <div v-if="!signedInUser" class="border-t border-border/60 pt-5 space-y-3">
                 <WebLoginCaptchaSetting />
-                <CaptchaProviderSetting v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-4" />
               </div>
 
               <div class="border-t border-border/60 pt-5 space-y-3">

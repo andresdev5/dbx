@@ -445,6 +445,7 @@ describe("saveShortcutSurface", () => {
   it("does nothing while the plugin center or driver store is open", () => {
     expect(saveShortcutSurface({ pluginCenterOpen: true, activeTabMode: "query" })).toBe("none");
     expect(saveShortcutSurface({ driverStoreOpen: true, activeTabMode: "query" })).toBe("none");
+    expect(saveShortcutSurface({ adminConsoleOpen: true, activeTabMode: "query" })).toBe("none");
   });
 
   it("prefers the settings page over the other browsing surfaces", () => {

@@ -763,6 +763,16 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   },
   { id: "mcp-config", category: "mcp", titleKey: "settings.mcpConfig", targetId: "mcp-client-config", route: { mcpManagementTab: "access", mcpTransportTab: "stdio" } },
   { id: "security", category: "security", titleKey: "settings.securityTab", targetId: "security", visible: webOnly },
+  { id: "security-mfa", category: "security", titleKey: "mfa.title", targetId: "security", visible: webOnly, keywordKeys: ["mfa.statusDisabled", "mfa.recoveryCodesHint"] },
+  {
+    id: "security-admin-console",
+    category: "security",
+    titleKey: "adminConsole.title",
+    descriptionKey: "adminConsole.settingsHint",
+    targetId: "security",
+    visible: webOnly,
+    keywordKeys: ["adminConsole.sections.users", "adminConsole.sections.roles", "adminConsole.sections.grants", "adminConsole.sections.audit"],
+  },
   { id: "security-password", category: "security", titleKey: "auth.changePassword", targetId: "security", visible: webOnly, keywordKeys: ["auth.changePasswordDescription", "auth.oldPassword", "auth.newPassword", "auth.confirmPassword"] },
   {
     id: "security-web-captcha",

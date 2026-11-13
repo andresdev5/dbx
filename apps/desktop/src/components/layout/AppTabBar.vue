@@ -19,6 +19,8 @@ const props = defineProps<{
   pluginCenterActive?: boolean;
   settingsPageOpen?: boolean;
   settingsPageActive?: boolean;
+  adminConsoleOpen?: boolean;
+  adminConsoleActive?: boolean;
   agentDriverUpdateCount?: number;
   detachedDropTarget?: boolean;
   canDetachTabs?: boolean;
@@ -33,6 +35,7 @@ const emit = defineEmits<{
   "close-plugin-center": [];
   "activate-settings-page": [];
   "close-settings-page": [];
+  "close-admin-console": [];
   "activate-tab": [tabId: string];
   "save-tab": [tabId: string];
   "discard-tab-close": [];
@@ -135,7 +138,7 @@ watch(
   },
 );
 
-type SpecialRegularSurface = "driverStore" | "pluginCenter" | "settings";
+type SpecialRegularSurface = "driverStore" | "pluginCenter" | "settings" | "adminConsole";
 
 function closeSpecialRegularSurfaces(keep?: SpecialRegularSurface) {
   if (keep !== "driverStore" && props.driverStoreOpen) {
@@ -149,6 +152,9 @@ function closeSpecialRegularSurfaces(keep?: SpecialRegularSurface) {
   }
   if (keep !== "pluginCenter" && props.pluginCenterOpen) {
     emit("close-plugin-center");
+  }
+  if (keep !== "adminConsole" && props.adminConsoleOpen) {
+    emit("close-admin-console");
   }
 }
 
@@ -165,6 +171,10 @@ function closeOtherActiveTabs() {
   }
   if (props.pluginCenterActive) {
     closeSpecialRegularSurfaces("pluginCenter");
+    return;
+  }
+  if (props.adminConsoleActive) {
+    closeSpecialRegularSurfaces("adminConsole");
     return;
   }
 
@@ -217,7 +227,7 @@ function handleCancelClose() {
 <template>
   <!-- Targets remain mounted while inactive so the original group bars can
        move here without losing their local presentation state. -->
-  <div v-show="driverStoreActive || pluginCenterActive || settingsPageActive" data-special-page-workspace class="flex min-h-0 min-w-0 flex-1 overflow-hidden" :class="layoutClass">
+  <div v-show="driverStoreActive || pluginCenterActive || settingsPageActive || adminConsoleActive" data-special-page-workspace class="flex min-h-0 min-w-0 flex-1 overflow-hidden" :class="layoutClass">
     <div data-special-page-navigation class="flex min-h-0 min-w-0 shrink-0 flex-col overflow-auto" :style="navigationStyle">
       <div v-for="group in queryStore.groups" :key="group.id" :ref="(element) => setTabBarTarget(group.id, element)" :data-special-page-tab-target="group.id" class="flex min-h-0 min-w-0" :class="isVerticalLayout ? 'flex-1' : 'shrink-0'" />
     </div>

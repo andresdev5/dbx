@@ -19,6 +19,7 @@ import {
   TableProperties,
   Settings,
   LogOut,
+  ShieldCheck,
   CloudDownload,
   Package,
   PlugZap,
@@ -84,6 +85,8 @@ const props = defineProps<{
   hasSqlFileConnections: boolean;
   immediateSyncing: boolean;
   showLogout?: boolean;
+  showAdminConsoleButton?: boolean;
+  showAdminConsole?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -108,6 +111,7 @@ const emit = defineEmits<{
   "open-backups": [];
   "open-mcp-settings": [];
   "immediate-sync": [];
+  "open-admin-console": [];
   logout: [];
 }>();
 
@@ -879,6 +883,16 @@ const toolbarStyle = computed(() => {
         </Button>
       </TooltipTrigger>
       <TooltipContent>{{ settingsTooltip }}</TooltipContent>
+    </Tooltip>
+
+    <Tooltip v-if="showAdminConsoleButton">
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :class="{ 'toolbar-action-button--active bg-accent': showAdminConsole }" :aria-label="t('adminConsole.title')" data-testid="toolbar-admin-console" @click="emit('open-admin-console')">
+          <ShieldCheck class="toolbar-action-icon h-4 w-4" :class="{ 'toolbar-action-icon--active': showAdminConsole }" />
+          <span v-if="showAdminConsole" class="toolbar-panel-status" aria-hidden="true" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{{ t("adminConsole.title") }}</TooltipContent>
     </Tooltip>
 
     <Tooltip v-if="showLogout">

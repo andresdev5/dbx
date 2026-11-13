@@ -5,6 +5,7 @@ export interface GlobalNavigationExecutorHandlers {
   activateSettings: () => void;
   activateDriverStore: () => void;
   activatePluginCenter: () => void;
+  activateAdminConsole?: () => void;
 }
 
 export async function restoreGlobalNavigationEntry(entry: GlobalNavigationEntry, handlers: GlobalNavigationExecutorHandlers): Promise<boolean> {
@@ -19,6 +20,10 @@ export async function restoreGlobalNavigationEntry(entry: GlobalNavigationEntry,
       return true;
     case "pluginCenter":
       handlers.activatePluginCenter();
+      return true;
+    case "adminConsole":
+      if (!handlers.activateAdminConsole) return false;
+      handlers.activateAdminConsole();
       return true;
     default:
       return false;

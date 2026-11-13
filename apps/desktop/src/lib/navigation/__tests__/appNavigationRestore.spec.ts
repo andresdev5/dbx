@@ -58,11 +58,12 @@ function harness(tabs: QueryTab[], reuseMode: DataTabReuseMode = "active-tab") {
   });
   const showSettingsPage = ref(false),
     showDriverStore = ref(false),
-    showPluginCenter = ref(false);
+    showPluginCenter = ref(false),
+    showAdminConsole = ref(false);
   const activateQueryTab = vi.fn((id: string) => {
     if (!queryStore.tabs.some((tab) => tab.id === id)) return false;
     queryStore.activeTabId = id;
-    showSettingsPage.value = showDriverStore.value = showPluginCenter.value = false;
+    showSettingsPage.value = showDriverStore.value = showPluginCenter.value = showAdminConsole.value = false;
     return true;
   });
   const openObjectBrowserTableTarget = vi.fn(async (target: NavigationTarget, options: NavigationOpenOptions = {}) => {
@@ -87,20 +88,26 @@ function harness(tabs: QueryTab[], reuseMode: DataTabReuseMode = "active-tab") {
     showSettingsPage,
     showDriverStore,
     showPluginCenter,
+    showAdminConsole,
     settingsPageTabOpen: ref(true),
     driverStoreTabOpen: ref(true),
     pluginCenterTabOpen: ref(true),
+    adminConsoleTabOpen: ref(true),
     activateSettingsPage: () => {
       showSettingsPage.value = true;
-      showDriverStore.value = showPluginCenter.value = false;
+      showDriverStore.value = showPluginCenter.value = showAdminConsole.value = false;
     },
     openDriverStorePage: () => {
       showDriverStore.value = true;
-      showSettingsPage.value = showPluginCenter.value = false;
+      showSettingsPage.value = showPluginCenter.value = showAdminConsole.value = false;
     },
     openPluginCenterPage: () => {
       showPluginCenter.value = true;
-      showSettingsPage.value = showDriverStore.value = false;
+      showSettingsPage.value = showDriverStore.value = showAdminConsole.value = false;
+    },
+    openAdminConsolePage: () => {
+      showAdminConsole.value = true;
+      showSettingsPage.value = showDriverStore.value = showPluginCenter.value = false;
     },
     activateQueryTab,
     openObjectBrowserTableTarget,

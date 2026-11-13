@@ -1,3 +1,4 @@
+import { adminConsoleZhCN } from "./adminConsole";
 import { tableCopyTaskZhCN as tableCopyTask } from "./tableCopyTask";
 import { tableColumnPasteZhCN as tableColumnPaste } from "./tableColumnPaste";
 import { sidebarMenuZhCN as sidebarMenu } from "./sidebarMenuMessages";
@@ -1064,6 +1065,7 @@ export default withEnglishFallback({
     roleAdmin: "管理员",
     roleUser: "用户",
   },
+  adminConsole: adminConsoleZhCN,
   users: {
     title: "用户",
     description: "创建账号并决定谁可以管理 DBX",

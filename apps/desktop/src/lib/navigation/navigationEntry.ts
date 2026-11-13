@@ -1,6 +1,6 @@
 import type { ObjectSourceKind } from "@/types/database";
 
-export type GlobalNavigationSurface = "query" | "settings" | "driverStore" | "pluginCenter";
+export type GlobalNavigationSurface = "query" | "settings" | "driverStore" | "pluginCenter" | "adminConsole";
 export type GlobalNavigationKind = "query" | "data" | "ddl" | "structure" | "objectSource" | "special";
 
 export interface GlobalNavigationEntry {

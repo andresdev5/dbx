@@ -10,6 +10,23 @@ export interface ManagedUser {
   display_name: string | null;
   role: "admin" | "user";
   active: boolean;
+  must_change_password?: boolean;
+  mfa_enabled?: boolean;
+  mfa_required?: boolean;
+  last_login_at?: number | null;
+  created_at?: number;
+}
+
+export interface IssuedUser {
+  user: ManagedUser;
+  temporary_password?: string;
+}
+
+export interface NewUserDraft {
+  username: string;
+  display_name: string | null;
+  role: "admin" | "user";
+  password: string | null;
 }
 
 export interface UserGroup {
@@ -120,6 +137,18 @@ export const accessAdmin = {
   effective: (userId: string, connectionId: string) => call<EffectivePermissions>("grants/effective", { user_id: userId, connection_id: connectionId }),
   policies: () => call<ConnectionPolicy[]>("connection-policies/list"),
   savePolicy: (policy: ConnectionPolicy) => call<ConnectionPolicy>("connection-policies/save", policy),
+};
+
+export const userAdmin = {
+  create: (draft: NewUserDraft) => call<IssuedUser>("users/create", draft),
+  update: (id: string, displayName: string | null, role: "admin" | "user") => call<ManagedUser>("users/update", { id, display_name: displayName, role }),
+  setActive: (id: string, active: boolean) => call<ManagedUser>("users/set-active", { id, active }),
+  resetPassword: (id: string) => call<IssuedUser>("users/reset-password", { id }),
+  setMfaRequired: (id: string, required: boolean) => call<ManagedUser>("users/set-mfa-required", { id, required }),
+  resetMfa: (id: string) => call<ManagedUser>("users/reset-mfa", { id }),
+  remove: (id: string) => call("users/delete", { id }),
+  mfaPolicy: async () => (await call<{ required_all: boolean }>("users/mfa-policy")).required_all,
+  setMfaPolicy: async (requiredAll: boolean) => (await call<{ required_all: boolean }>("users/mfa-policy/save", { required_all: requiredAll })).required_all,
 };
 
 export async function listConnections(): Promise<ConnectionSummary[]> {

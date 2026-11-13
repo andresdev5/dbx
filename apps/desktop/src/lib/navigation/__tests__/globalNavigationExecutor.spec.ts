@@ -15,6 +15,14 @@ describe("global navigation executor", () => {
     expect(handlers.activateSettings).toHaveBeenCalledOnce();
   });
 
+  it("should restore the administration page only when a handler is available", async () => {
+    const activateAdminConsole = vi.fn();
+    const base = { restoreQuery: async () => false, activateSettings: () => {}, activateDriverStore: () => {}, activatePluginCenter: () => {} };
+    expect(await restoreGlobalNavigationEntry({ id: "a", surface: "adminConsole" }, { ...base, activateAdminConsole })).toBe(true);
+    expect(activateAdminConsole).toHaveBeenCalledOnce();
+    expect(await restoreGlobalNavigationEntry({ id: "a", surface: "adminConsole" }, base)).toBe(false);
+  });
+
   it("reports a closed query tab as unrestorable", async () => {
     const restored = await restoreGlobalNavigationEntry({ id: "q", surface: "query", tabId: "closed" }, { restoreQuery: async () => false, activateSettings: () => {}, activateDriverStore: () => {}, activatePluginCenter: () => {} });
     expect(restored).toBe(false);

@@ -63,6 +63,7 @@ import {
   Search,
   Server,
   Settings,
+  ShieldCheck,
   Tag,
   Ungroup,
   X,
@@ -138,7 +139,7 @@ const props = defineProps<{
   /** A detached tab is being dragged over this bar — highlight it as the drop target. */
   detachedDropTarget?: boolean;
   /** App-level special pages appended after the tabs. */
-  specialPageTabs?: { settingsOpen: boolean; settingsActive: boolean; driverStoreOpen: boolean; driverStoreActive: boolean; pluginCenterOpen: boolean; pluginCenterActive: boolean; driverUpdateCount: number };
+  specialPageTabs?: { settingsOpen: boolean; settingsActive: boolean; driverStoreOpen: boolean; driverStoreActive: boolean; pluginCenterOpen: boolean; pluginCenterActive: boolean; adminConsoleOpen?: boolean; adminConsoleActive?: boolean; driverUpdateCount: number };
 }>();
 
 const emit = defineEmits<{
@@ -156,6 +157,8 @@ const emit = defineEmits<{
   "close-driver-store": [];
   "activate-plugin-center": [];
   "close-plugin-center": [];
+  "activate-admin-console": [];
+  "close-admin-console": [];
   "save-all-tabs": [];
 }>();
 
@@ -184,7 +187,7 @@ const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout ==
 // Special pages append to the focused group's strip only: one instance at a
 // time, in the pane the user is working in (v0.6.2 kept them in the single strip).
 const showSpecialPageTabs = computed(() => {
-  if (!props.specialPageTabs || !(props.specialPageTabs.settingsOpen || props.specialPageTabs.driverStoreOpen || props.specialPageTabs.pluginCenterOpen)) return false;
+  if (!props.specialPageTabs || !(props.specialPageTabs.settingsOpen || props.specialPageTabs.driverStoreOpen || props.specialPageTabs.pluginCenterOpen || props.specialPageTabs.adminConsoleOpen)) return false;
   // With no regular query tabs there is no focus event to establish the
   // focused group. Render the special-page tab in the sole (main) group so
   // opening Plugin Center or Driver Manager by itself still creates a tab.
@@ -192,7 +195,7 @@ const showSpecialPageTabs = computed(() => {
   const isEmptyWorkspaceMainGroup = queryStore.tabs.length === 0 && props.groupId === queryStore.groups[0]?.id;
   return isFocusedGroup || isEmptyWorkspaceMainGroup;
 });
-const specialPageActive = computed(() => !!(props.specialPageTabs?.settingsActive || props.specialPageTabs?.driverStoreActive || props.specialPageTabs?.pluginCenterActive));
+const specialPageActive = computed(() => !!(props.specialPageTabs?.settingsActive || props.specialPageTabs?.driverStoreActive || props.specialPageTabs?.pluginCenterActive || props.specialPageTabs?.adminConsoleActive));
 
 function isTabActive(tab: QueryTab): boolean {
   return !specialPageActive.value && tab.id === props.activeTabId;
@@ -262,14 +265,19 @@ function toggleCompactTabTitle() {
   compactTabTitle.value = !compactTabTitle.value;
 }
 
-function getSpecialPageTabMenuItems(surface: "settings" | "driverStore" | "pluginCenter"): ContextMenuItem[] {
-  const closeCurrent = surface === "settings" ? () => emit("close-settings") : surface === "driverStore" ? () => emit("close-driver-store") : () => emit("close-plugin-center");
-  const otherOpen =
-    surface === "settings" ? props.specialPageTabs?.driverStoreOpen || props.specialPageTabs?.pluginCenterOpen : surface === "driverStore" ? props.specialPageTabs?.settingsOpen || props.specialPageTabs?.pluginCenterOpen : props.specialPageTabs?.settingsOpen || props.specialPageTabs?.driverStoreOpen;
+function getSpecialPageTabMenuItems(surface: SpecialPageSurface): ContextMenuItem[] {
+  const closeCurrent = () => closeSpecialPage(surface);
+  const openSurfaces: Record<SpecialPageSurface, boolean> = {
+    settings: !!props.specialPageTabs?.settingsOpen,
+    driverStore: !!props.specialPageTabs?.driverStoreOpen,
+    pluginCenter: !!props.specialPageTabs?.pluginCenterOpen,
+    adminConsole: !!props.specialPageTabs?.adminConsoleOpen,
+  };
+  const otherOpen = (Object.keys(openSurfaces) as SpecialPageSurface[]).some((candidate) => candidate !== surface && openSurfaces[candidate]);
   const closeOthers = () => {
-    if (surface !== "settings") emit("close-settings");
-    if (surface !== "driverStore") emit("close-driver-store");
-    if (surface !== "pluginCenter") emit("close-plugin-center");
+    for (const candidate of Object.keys(openSurfaces) as SpecialPageSurface[]) {
+      if (candidate !== surface) closeSpecialPage(candidate);
+    }
   };
   return [
     { label: compactTabTitle.value ? t("contextMenu.fullTabTitle") : t("contextMenu.compactTabTitle"), action: toggleCompactTabTitle, icon: compactTabTitle.value ? Maximize2 : Minimize2 },
@@ -1241,7 +1249,7 @@ const twoRowSelectedKey = computed<string | null>(() => {
   return items[0]!.key;
 });
 
-type SpecialPageSurface = "pluginCenter" | "settings" | "driverStore";
+type SpecialPageSurface = "pluginCenter" | "settings" | "driverStore" | "adminConsole";
 
 /**
  * App-level surfaces pinned to the right end of the group rail. They are
@@ -1256,18 +1264,21 @@ const railSpecialPageItems = computed<{ surface: SpecialPageSurface; label: stri
   if (pages.pluginCenterOpen) items.push({ surface: "pluginCenter", label: t("toolbar.pluginCenter"), icon: PlugZap, iconClass: "text-violet-600 dark:text-violet-400", active: !!pages.pluginCenterActive, badge: 0 });
   if (pages.settingsOpen) items.push({ surface: "settings", label: t("settings.title"), icon: Settings, iconClass: "text-sky-600 dark:text-sky-400", active: !!pages.settingsActive, badge: 0 });
   if (pages.driverStoreOpen) items.push({ surface: "driverStore", label: t("toolbar.driverManager"), icon: Package, iconClass: "text-amber-600 dark:text-amber-400", active: !!pages.driverStoreActive, badge: pages.driverUpdateCount ?? 0 });
+  if (pages.adminConsoleOpen) items.push({ surface: "adminConsole", label: t("adminConsole.title"), icon: ShieldCheck, iconClass: "text-emerald-600 dark:text-emerald-400", active: !!pages.adminConsoleActive, badge: 0 });
   return items;
 });
 
 function activateSpecialPage(surface: SpecialPageSurface) {
   if (surface === "settings") emit("activate-settings");
   else if (surface === "driverStore") emit("activate-driver-store");
+  else if (surface === "adminConsole") emit("activate-admin-console");
   else emit("activate-plugin-center");
 }
 
 function closeSpecialPage(surface: SpecialPageSurface) {
   if (surface === "settings") emit("close-settings");
   else if (surface === "driverStore") emit("close-driver-store");
+  else if (surface === "adminConsole") emit("close-admin-console");
   else emit("close-plugin-center");
 }
 
@@ -2033,6 +2044,7 @@ watch(
     props.tabs.map((tab) => `${tab.id}:${tab.pinned ? "1" : "0"}:${tab.title}:${tab.mode}`).join("|"),
     props.specialPageTabs?.settingsOpen,
     props.specialPageTabs?.driverStoreOpen,
+    props.specialPageTabs?.adminConsoleOpen,
     settingsStore.editorSettings.tabLayout,
     settingsStore.editorSettings.tabGroupMode,
     settingsStore.editorSettings.tabMaxWidth,
@@ -2068,7 +2080,7 @@ watch(
   { flush: "post" },
 );
 
-watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?.driverStoreActive, () => props.specialPageTabs?.pluginCenterActive, () => settingsStore.editorSettings.tabPlacement, () => props.tabBarCollapsed], () => {
+watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?.driverStoreActive, () => props.specialPageTabs?.pluginCenterActive, () => props.specialPageTabs?.adminConsoleActive, () => settingsStore.editorSettings.tabPlacement, () => props.tabBarCollapsed], () => {
   nextTick(() => {
     updateScrollButtons();
     if (showSpecialPageTabs.value && specialPageActive.value) {
@@ -2486,6 +2498,31 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                         {{ (specialPageTabs?.driverUpdateCount ?? 0) > 99 ? "99+" : specialPageTabs?.driverUpdateCount }}
                       </span>
                       <button v-if="!isTabBarCollapsed" class="shrink-0 rounded p-0.5 hover:bg-muted-foreground/20" :aria-label="t('common.close')" :title="t('common.close')" @click.stop="emit('close-driver-store')">
+                        <X class="h-3 w-3" />
+                      </button>
+                    </div>
+                  </CustomContextMenu>
+                  <CustomContextMenu v-if="specialPageTabs?.adminConsoleOpen" :items="getSpecialPageTabMenuItems('adminConsole')" v-slot="{ onContextMenu }">
+                    <div
+                      data-admin-console-tab
+                      class="app-tab-pill group flex shrink-0 cursor-default items-center gap-1 px-2 text-xs transition-colors whitespace-nowrap select-none"
+                      :class="specialPageTabClass(!!specialPageTabs?.adminConsoleActive)"
+                      :style="specialPageTabStyle(!!specialPageTabs?.adminConsoleActive)"
+                      :data-active-tab="specialPageTabs?.adminConsoleActive"
+                      :title="t('adminConsole.title')"
+                      :aria-label="t('adminConsole.title')"
+                      :aria-pressed="!!specialPageTabs?.adminConsoleActive"
+                      role="button"
+                      tabindex="0"
+                      @click="emit('activate-admin-console')"
+                      @keydown.enter.self.prevent="emit('activate-admin-console')"
+                      @keydown.space.self.prevent="emit('activate-admin-console')"
+                      @contextmenu="onContextMenu"
+                      @mousedown.middle.prevent="emit('close-admin-console')"
+                    >
+                      <ShieldCheck class="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                      <span v-if="!isTabBarCollapsed" class="min-w-0 flex-1 truncate">{{ t("adminConsole.title") }}</span>
+                      <button v-if="!isTabBarCollapsed" class="shrink-0 rounded p-0.5 hover:bg-muted-foreground/20" :aria-label="t('common.close')" :title="t('common.close')" @click.stop="emit('close-admin-console')">
                         <X class="h-3 w-3" />
                       </button>
                     </div>

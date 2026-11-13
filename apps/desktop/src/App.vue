@@ -259,6 +259,7 @@ const DriverStorePage = defineAsyncComponent(() => import("@/components/config/D
 const PluginCenterPage = defineAsyncComponent(() => import("@/components/plugins/PluginContributionsPanel.vue"));
 const PluginBottomDock = defineAsyncComponent(() => import("@/components/plugins/PluginBottomDock.vue"));
 const EditorSettingsPage = defineAsyncComponent(() => import("@/components/editor/EditorSettingsDialog.vue"));
+const AdminConsolePage = defineAsyncComponent(() => import("@/components/auth/admin/AdminConsolePage.vue"));
 const TableCopyProgressDialog = defineAsyncComponent(() => import("@/components/objects/TableCopyProgressDialog.vue"));
 const UpdateDialog = defineAsyncComponent(() => import("@/components/layout/UpdateDialog.vue"));
 const CloseActionPromptDialog = defineAsyncComponent(() => import("@/components/layout/CloseActionPromptDialog.vue"));
@@ -500,12 +501,18 @@ const pluginCenterTabOpen = ref(false);
 const pluginCenterActive = ref(false);
 const pluginCenterFocus = ref<PluginCenterFocus | null>(null);
 const connectionPluginProvider = ref<PluginCenterFocus | null>(null);
-const settingsReturnSurface = ref<"query" | "driverStore" | "pluginCenter" | "welcome">("welcome");
+const adminConsoleTabOpen = ref(false);
+const adminConsoleActive = ref(false);
+const webUserRole = ref<string | null>(startupProps.startupAuthentication?.user?.role ?? null);
+const currentWebUserId = ref(startupProps.startupAuthentication?.user?.id ?? "");
+const settingsReturnSurface = ref<"query" | "driverStore" | "pluginCenter" | "adminConsole" | "welcome">("welcome");
 const immediateSyncing = ref(false);
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
 const showPluginCenter = computed(() => pluginCenterTabOpen.value && pluginCenterActive.value);
 const showSettingsPage = computed(() => Boolean(settingsPageTabOpen.value && settingsStore.settingsPageActive));
-const isSpecialPageActive = computed(() => !isDetachedWindowContext && (driverStoreActive.value || pluginCenterActive.value || settingsStore.settingsPageActive));
+const showAdminConsole = computed(() => adminConsoleTabOpen.value && adminConsoleActive.value);
+const canOpenAdminConsole = computed(() => !isDesktop && needsAuth.value && webUserRole.value === "admin");
+const isSpecialPageActive = computed(() => !isDetachedWindowContext && (driverStoreActive.value || pluginCenterActive.value || adminConsoleActive.value || settingsStore.settingsPageActive));
 const showQuickOpen = ref(false);
 const quickOpenForceContent = ref(false);
 const showTabSwitcher = ref(false);
@@ -1283,6 +1290,8 @@ const specialPageTabs = computed(() => ({
   settingsActive: settingsStore.settingsPageActive,
   pluginCenterOpen: pluginCenterTabOpen.value,
   pluginCenterActive: pluginCenterActive.value,
+  adminConsoleOpen: adminConsoleTabOpen.value,
+  adminConsoleActive: adminConsoleActive.value,
   driverStoreOpen: driverStoreTabOpen.value,
   driverStoreActive: driverStoreActive.value,
   driverUpdateCount: showDriverStoreUpdateBadge.value,
@@ -1329,6 +1338,8 @@ provide(EDITOR_TOOLBAR_ACTIONS, {
   closePluginCenter: closePluginCenterPage,
   activateDriverStore: () => openDriverStorePage(),
   closeDriverStore: closeDriverStorePage,
+  activateAdminConsole: () => openAdminConsolePage(),
+  closeAdminConsole: closeAdminConsolePage,
 });
 
 // Upstream "preview changes" entry: dormant until the group toolbar wires the
@@ -1450,7 +1461,7 @@ function openSettings(initialTab = "appearance", initialSection?: string) {
   settingsInitialSection.value = initialSection;
   settingsNavigationRequestId.value += 1;
   if (!settingsStore.settingsPageActive) {
-    settingsReturnSurface.value = showDriverStore.value ? "driverStore" : showPluginCenter.value ? "pluginCenter" : activeTab.value ? "query" : "welcome";
+    settingsReturnSurface.value = showDriverStore.value ? "driverStore" : showPluginCenter.value ? "pluginCenter" : showAdminConsole.value ? "adminConsole" : activeTab.value ? "query" : "welcome";
   }
   activateSettingsPage();
 }
@@ -1488,12 +1499,13 @@ async function openImmediateSync() {
   }
 }
 
-type MainContentSurface = "query" | "settings" | "driverStore" | "pluginCenter";
+type MainContentSurface = "query" | "settings" | "driverStore" | "pluginCenter" | "adminConsole";
 
 function activateMainContentSurface(surface: MainContentSurface) {
   settingsStore.settingsPageActive = surface === "settings";
   driverStoreActive.value = surface === "driverStore";
   pluginCenterActive.value = surface === "pluginCenter";
+  adminConsoleActive.value = surface === "adminConsole";
   lastFocusedSidebarSurface.value = false;
 }
 
@@ -1539,6 +1551,10 @@ function activateOpenSpecialPageFallback() {
   }
   if (pluginCenterTabOpen.value) {
     activateMainContentSurface("pluginCenter");
+    return;
+  }
+  if (adminConsoleTabOpen.value) {
+    activateMainContentSurface("adminConsole");
   }
 }
 
@@ -1562,12 +1578,20 @@ function finishCloseSettingsPage() {
     activateMainContentSurface("pluginCenter");
     return;
   }
+  if (settingsReturnSurface.value === "adminConsole" && adminConsoleTabOpen.value) {
+    activateMainContentSurface("adminConsole");
+    return;
+  }
   if (driverStoreTabOpen.value) {
     activateMainContentSurface("driverStore");
     return;
   }
   if (pluginCenterTabOpen.value) {
     activateMainContentSurface("pluginCenter");
+    return;
+  }
+  if (adminConsoleTabOpen.value) {
+    activateMainContentSurface("adminConsole");
     return;
   }
   activateMainContentSurface("query");
@@ -1600,6 +1624,8 @@ function closeDriverStorePage() {
     activateMainContentSurface("pluginCenter");
   } else if (settingsPageTabOpen.value) {
     activateMainContentSurface("settings");
+  } else if (adminConsoleTabOpen.value) {
+    activateMainContentSurface("adminConsole");
   } else {
     activateMainContentSurface("query");
   }
@@ -1622,9 +1648,43 @@ function closePluginCenterPage() {
     activateMainContentSurface("driverStore");
   } else if (settingsPageTabOpen.value) {
     activateMainContentSurface("settings");
+  } else if (adminConsoleTabOpen.value) {
+    activateMainContentSurface("adminConsole");
   } else {
     activateMainContentSurface("query");
   }
+}
+
+function openAdminConsolePage() {
+  if (!canOpenAdminConsole.value) return;
+  adminConsoleTabOpen.value = true;
+  activateMainContentSurface("adminConsole");
+}
+
+function closeAdminConsolePage() {
+  adminConsoleTabOpen.value = false;
+  if (driverStoreTabOpen.value) {
+    activateMainContentSurface("driverStore");
+  } else if (pluginCenterTabOpen.value) {
+    activateMainContentSurface("pluginCenter");
+  } else if (settingsPageTabOpen.value) {
+    activateMainContentSurface("settings");
+  } else {
+    activateMainContentSurface("query");
+  }
+}
+
+async function refreshWebUserRole() {
+  if (isDesktop) return;
+  try {
+    const user = (await checkStartupAuthentication()).user;
+    webUserRole.value = user?.role ?? null;
+    currentWebUserId.value = user?.id ?? "";
+  } catch {
+    webUserRole.value = null;
+    currentWebUserId.value = "";
+  }
+  if (!canOpenAdminConsole.value && adminConsoleTabOpen.value) closeAdminConsolePage();
 }
 
 function openPluginConnectionDialog(pluginId: string, providerId: string) {
@@ -1984,6 +2044,7 @@ function currentGlobalNavigationEntry(): GlobalNavigationEntry | null {
   if (showSettingsPage.value) surface = "settings";
   else if (showDriverStore.value) surface = "driverStore";
   else if (showPluginCenter.value) surface = "pluginCenter";
+  else if (showAdminConsole.value) surface = "adminConsole";
   else if (queryStore.activeTabId) surface = "query";
   if (!surface) return null;
   const tab = surface === "query" ? activeTab.value : undefined;
@@ -2038,6 +2099,7 @@ watch(
       showSettingsPage.value,
       showDriverStore.value,
       showPluginCenter.value,
+      showAdminConsole.value,
       activeTab.value?.mode,
       activeTab.value?.tableInfoTab,
       activeTab.value?.sourceView,
@@ -4358,6 +4420,7 @@ function isGlobalNavigationEntryAvailable(candidate: GlobalNavigationEntry): boo
   if (candidate.surface === "settings") return settingsPageTabOpen.value;
   if (candidate.surface === "driverStore") return driverStoreTabOpen.value;
   if (candidate.surface === "pluginCenter") return pluginCenterTabOpen.value;
+  if (candidate.surface === "adminConsole") return adminConsoleTabOpen.value;
   return false;
 }
 
@@ -4398,6 +4461,10 @@ async function completeGlobalNavigation(entry: GlobalNavigationEntry, previousHi
       },
       activatePluginCenter: () => {
         openPluginCenterPage();
+        accept();
+      },
+      activateAdminConsole: () => {
+        openAdminConsolePage();
         accept();
       },
     });
@@ -4628,6 +4695,7 @@ function focusSearchInAuxiliarySurface(target: Element | null): boolean {
     return focusSearchInput(selector);
   }
   if (showPluginCenter.value) return focusSearchInput("[data-plugin-marketplace-search]");
+  if (showAdminConsole.value) return focusSearchInput("[data-admin-console-search]");
 
   if (showAiPanel.value && target?.closest("[data-ai-assistant-root], [data-ai-conversation-search]")) {
     if (aiAssistantRef.value) return aiAssistantRef.value.focusSearch();
@@ -4703,6 +4771,8 @@ async function closeActiveSurface() {
     closePluginCenterPage();
   } else if (showDriverStore.value) {
     closeDriverStorePage();
+  } else if (showAdminConsole.value) {
+    closeAdminConsolePage();
   } else if (queryStore.activeTabId) {
     if (await queryStore.clearQueryResults(queryStore.activeTabId)) return;
     queryStore.closeTab(queryStore.activeTabId);
@@ -4744,7 +4814,7 @@ async function handleKeydown(e: KeyboardEvent) {
   // normalized plain object keeps that to a cheap cache hit per key press.
   const shortcuts = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
   if (showTabSwitcher.value) return;
-  if (isFocusWhereShortcut(e, shortcuts) && !showSettingsPage.value && !showPluginCenter.value && !showDriverStore.value) {
+  if (isFocusWhereShortcut(e, shortcuts) && !showSettingsPage.value && !showPluginCenter.value && !showDriverStore.value && !showAdminConsole.value) {
     const target = e.target instanceof Element ? e.target : null;
     if (!target?.closest('[role="dialog"], [role="alertdialog"]') && contentAreaRef.value?.focusWhere()) {
       e.preventDefault();
@@ -4752,7 +4822,7 @@ async function handleKeydown(e: KeyboardEvent) {
       return;
     }
   }
-  if (isEditTableStructureShortcut(e, shortcuts) && !showSettingsPage.value && !showPluginCenter.value && !showDriverStore.value) {
+  if (isEditTableStructureShortcut(e, shortcuts) && !showSettingsPage.value && !showPluginCenter.value && !showDriverStore.value && !showAdminConsole.value) {
     const target = e.target instanceof Element ? e.target : null;
     if (!target?.closest('[role="dialog"], [role="alertdialog"]') && !eventTargetAllowsNativeClipboard(e) && contentAreaRef.value?.openTableStructureEditor?.()) {
       e.preventDefault();
@@ -4863,7 +4933,7 @@ async function handleKeydown(e: KeyboardEvent) {
   }
   if (isFocusResultGridShortcut(e, shortcuts) || isFocusSqlEditorShortcut(e, shortcuts)) {
     const target = e.target instanceof Element ? e.target : null;
-    if (!showSettingsPage.value && !showPluginCenter.value && !showDriverStore.value && !target?.closest('[role="dialog"], [role="alertdialog"]')) {
+    if (!showSettingsPage.value && !showPluginCenter.value && !showDriverStore.value && !showAdminConsole.value && !target?.closest('[role="dialog"], [role="alertdialog"]')) {
       const focused = isFocusResultGridShortcut(e, shortcuts) ? contentAreaRef.value?.focusResultGrid() : contentAreaRef.value?.focusSqlEditor();
       if (focused) {
         e.preventDefault();
@@ -4977,6 +5047,7 @@ async function handleKeydown(e: KeyboardEvent) {
       settingsPageOpen: showSettingsPage.value,
       pluginCenterOpen: showPluginCenter.value,
       driverStoreOpen: showDriverStore.value,
+      adminConsoleOpen: showAdminConsole.value,
       activeTabMode: activeTab.value?.mode ?? null,
       saveSqlDialogOpen: showSaveSqlDialog.value,
     });
@@ -5104,6 +5175,7 @@ async function handleWebLogout() {
 
 async function initApp() {
   const t0 = performance.now();
+  void refreshWebUserRole();
   console.log("[STARTUP] initApp begin");
   const savedSqlInitialization = Promise.all([initSavedSqlEditorPositions(), savedSqlStore.initFromStorage()])
     .then(() => {
@@ -5346,7 +5418,7 @@ onMounted(async () => {
   window.addEventListener("keydown", handleTabSwitcherKeydownCapture, true);
   window.addEventListener("keydown", handleAuxiliarySearchKeydownCapture, true);
   unregisterCopyActiveResultShortcut = registerCopyActiveResultShortcut(() => ({
-    enabled: !showTabSwitcher.value && activeTab.value?.mode === "query" && !showSettingsPage.value && !showPluginCenter.value && !showDriverStore.value && !showConnectionDialog.value && (workspaceRendered() || isZenMode.value),
+    enabled: !showTabSwitcher.value && activeTab.value?.mode === "query" && !showSettingsPage.value && !showPluginCenter.value && !showDriverStore.value && !showAdminConsole.value && !showConnectionDialog.value && (workspaceRendered() || isZenMode.value),
     shortcuts: normalizeShortcutSettings(settingsStore.editorSettings.shortcuts),
     copyActiveResult: () => contentAreaRef.value?.copyActiveResult() ?? false,
   }));
@@ -5516,6 +5588,8 @@ onUnmounted(() => {
           :has-sql-file-connections="hasSqlFileConnections"
           :immediate-syncing="immediateSyncing"
           :show-logout="!isDesktop && needsAuth"
+          :show-admin-console-button="canOpenAdminConsole"
+          :show-admin-console="showAdminConsole"
           @new-connection="showConnectionDialog = true"
           @expand-sidebar="setSidebarOpen(true)"
           @new-query="newQuery({ preferredSource: lastFocusedSidebarSurface ? 'sidebar' : undefined })"
@@ -5537,6 +5611,7 @@ onUnmounted(() => {
           @open-data-compare="dialogs.showDataCompareDialog.value = true"
           @open-backups="openSettings('backups')"
           @open-mcp-settings="openSettings('mcp')"
+          @open-admin-console="openAdminConsolePage"
           @logout="handleWebLogout"
         />
 
@@ -5577,6 +5652,8 @@ onUnmounted(() => {
                 :plugin-center-active="pluginCenterActive"
                 :settings-page-open="settingsPageTabOpen"
                 :settings-page-active="settingsStore.settingsPageActive"
+                :admin-console-open="adminConsoleTabOpen"
+                :admin-console-active="adminConsoleActive"
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
                 :detached-drop-target="detachedDropTargetTabId !== null"
                 :can-detach-tabs="isDesktop"
@@ -5589,6 +5666,7 @@ onUnmounted(() => {
                 @close-driver-store="closeDriverStorePage"
                 @close-plugin-center="closePluginCenterPage"
                 @close-settings-page="closeSettingsPage"
+                @close-admin-console="closeAdminConsolePage"
                 @save-tab="handleSaveTab"
                 @discard-tab-close="handleDiscardPendingTabClose"
                 @save-all-tab-close="handleSaveAllPendingTabClose"
@@ -5615,6 +5693,7 @@ onUnmounted(() => {
                   @new-connection="openPluginConnectionDialog"
                   @plugin-runtime-replaced="refreshPluginWorkbenches"
                 />
+                <AdminConsolePage v-if="adminConsoleTabOpen" v-show="adminConsoleActive" class="flex-1 min-h-0" :current-user-id="currentWebUserId" />
                 <EditorSettingsPage
                   v-if="settingsPageTabOpen"
                   v-show="settingsStore.settingsPageActive"
@@ -5651,6 +5730,7 @@ onUnmounted(() => {
                   "
                   @open-mcp-settings="openSettings('mcp')"
                   @ai-config-deep-link-handled="settingsAiConfigDraft = null"
+                  @open-admin-console="openAdminConsolePage"
                   @logout="handleWebLogout"
                 />
               </AppTabBar>
@@ -5678,7 +5758,7 @@ onUnmounted(() => {
                 </DialogContent>
               </Dialog>
               <div
-                v-show="!driverStoreActive && !pluginCenterActive && !settingsStore.settingsPageActive"
+                v-show="!driverStoreActive && !pluginCenterActive && !adminConsoleActive && !settingsStore.settingsPageActive"
                 class="flex min-h-0 min-w-0 flex-1"
                 :class="activeTab?.mode === 'plugin-workbench' && isVerticalTabPlacement ? (settingsStore.editorSettings.tabPlacement === 'right' ? 'flex-row-reverse' : 'flex-row') : 'flex-col'"
               >
@@ -5698,7 +5778,7 @@ onUnmounted(() => {
                     @start-resize="startTabBarResize"
                     @toggle-collapse="toggleTabBarCollapsed"
                     :active-tab="activeTab ?? undefined"
-                    :show-tab-navigation="queryStore.tabs.length > 0 || settingsPageTabOpen || driverStoreTabOpen || pluginCenterTabOpen"
+                    :show-tab-navigation="queryStore.tabs.length > 0 || settingsPageTabOpen || driverStoreTabOpen || pluginCenterTabOpen || adminConsoleTabOpen"
                     :active-connection="activeConnection"
                     :tab-bar-width="tabBarWidth"
                     :tab-bar-collapsed="tabBarCollapsed"

@@ -1,3 +1,4 @@
+import { adminConsoleEs } from "./adminConsole";
 import { tableColumnPasteEs as tableColumnPaste } from "./tableColumnPaste";
 import { sidebarMenuEs as sidebarMenu } from "./sidebarMenuMessages";
 import { oceanbaseCloneDialogEs as oceanbaseCloneDialog } from "./oceanbaseCloneDialog";
@@ -924,6 +925,7 @@ export default withEnglishFallback({
     roleAdmin: "Administrador",
     roleUser: "Usuario",
   },
+  adminConsole: adminConsoleEs,
   users: {
     title: "Usuarios",
     description: "Crea cuentas y decide quién puede administrar DBX",

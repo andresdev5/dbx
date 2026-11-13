@@ -1,3 +1,4 @@
+import { adminConsoleEn } from "./adminConsole";
 import { tableCopyTaskEn as tableCopyTask } from "./tableCopyTask";
 import { tableColumnPasteEn as tableColumnPaste } from "./tableColumnPaste";
 import { sidebarMenuEn as sidebarMenu } from "./sidebarMenuMessages";
@@ -1128,6 +1129,7 @@ export default {
     roleAdmin: "Administrator",
     roleUser: "User",
   },
+  adminConsole: adminConsoleEn,
   users: {
     title: "Users",
     description: "Create accounts and decide who can administer DBX",

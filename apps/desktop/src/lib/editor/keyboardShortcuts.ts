@@ -407,6 +407,7 @@ export interface SaveShortcutSurfaceInput {
   settingsPageOpen?: boolean;
   pluginCenterOpen?: boolean;
   driverStoreOpen?: boolean;
+  adminConsoleOpen?: boolean;
   activeTabMode?: string | null;
   saveSqlDialogOpen?: boolean;
 }
@@ -415,7 +416,7 @@ export function saveShortcutSurface(input: SaveShortcutSurfaceInput): SaveShortc
   if (input.settingsPageOpen) return "settings";
   // Browsing surfaces have nothing to save, and must not fall through to the
   // query branch just because a query tab is still the active tab.
-  if (input.pluginCenterOpen || input.driverStoreOpen) return "none";
+  if (input.pluginCenterOpen || input.driverStoreOpen || input.adminConsoleOpen) return "none";
   if (input.activeTabMode !== "query" || input.saveSqlDialogOpen) return "none";
   return "query";
 }
