@@ -356,6 +356,8 @@ import ChangelogPanel from "@/components/settings/ChangelogPanel.vue";
 import WebLoginCaptchaSetting from "@/components/settings/WebLoginCaptchaSetting.vue";
 import UserManagementPanel from "@/components/auth/UserManagementPanel.vue";
 import AccessControlPanel from "@/components/auth/access/AccessControlPanel.vue";
+import AuditLogPanel from "@/components/auth/audit/AuditLogPanel.vue";
+import SessionsPanel from "@/components/auth/audit/SessionsPanel.vue";
 import SettingsTransferPanel from "@/components/settings/SettingsTransferPanel.vue";
 import McpCapabilityBrowser from "@/components/settings/McpCapabilityBrowser.vue";
 import McpPluginToolsModeSetting from "@/components/settings/McpPluginToolsModeSetting.vue";
@@ -14024,6 +14026,14 @@ LIMIT 100;</pre>
 
               <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
                 <AccessControlPanel />
+              </div>
+
+              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
+                <SessionsPanel />
+              </div>
+
+              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
+                <AuditLogPanel />
               </div>
 
               <div v-if="!signedInUser || signedInUser.role === 'admin'" class="border-t border-border/60 pt-5 space-y-3">
