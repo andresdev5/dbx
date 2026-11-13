@@ -238,11 +238,12 @@ pub(super) async fn client_for_state(state: &AppState, connection_id: &str) -> R
 }
 
 pub(crate) async fn ensure_writable_core(state: &AppState, connection_id: &str, action: &str) -> Result<(), String> {
-    if let Some(name) = crate::query::connection_readonly_name(state, connection_id).await {
+    if let Some(name) = crate::query::read_only_protection_name(state, connection_id).await {
         return Err(format!(
             "CONSUL_READ_ONLY: connection '{name}' has read-only protection enabled; {action} blocked"
         ));
     }
+    crate::authz::authorize_any_write(state, connection_id).await?;
     Ok(())
 }
 

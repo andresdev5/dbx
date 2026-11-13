@@ -88,9 +88,19 @@ impl Compilation {
             return Err(INACCESSIBLE.into());
         }
         let request = &self.request;
-        if let Some(name) = super::super::connection_readonly_name(app, &request.connection_id).await {
+        if let Some(name) = super::super::read_only_protection_name(app, &request.connection_id).await {
             return Err(format!("Connection '{name}' is read-only; unlock writes before compiling debug information"));
         }
+        crate::authz::authorize_resource(
+            app,
+            &request.connection_id,
+            Some(&request.database),
+            request.preview["schema"].as_str(),
+            None,
+            dbx_authz::Operations::ALTER,
+            true,
+        )
+        .await?;
         let configs = app.configs.read().await;
         let config = configs.get(&request.connection_id).ok_or("The original connection no longer exists")?;
         if (crate::production_safety::is_production_database(config, &request.database)

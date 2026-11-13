@@ -4,6 +4,7 @@ mod bootstrap;
 mod captcha;
 mod credentials;
 mod demo;
+mod engine_access;
 mod error;
 mod identity;
 mod request_context;
@@ -1717,6 +1718,7 @@ async fn serve() -> Result<(), String> {
         api.route("/query/build-duckdb-attach-database-sql", post(routes::query::build_duckdb_attach_database_sql));
 
     let api = add_mq_routes(api)
+        .layer(middleware::from_fn_with_state(web_state.clone(), engine_access::engine_access_middleware))
         .layer(middleware::from_fn_with_state(web_state.clone(), migration_gate))
         .layer(middleware::from_fn_with_state(web_state.clone(), demo::demo_mode_gate))
         .layer(middleware::from_fn_with_state(web_state.clone(), auth::auth_middleware))

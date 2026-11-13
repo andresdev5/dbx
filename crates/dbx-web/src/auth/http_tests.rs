@@ -133,7 +133,12 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/admin/sessions/revoke", post(crate::routes::admin_audit::revoke_session))
         .route("/api/connection/list", get(crate::routes::connection::load_connections))
         .route("/api/database-backups", post(crate::routes::scheduled_backup::command))
+        .route("/api/nacos/configs/get", post(|| async { "config" }))
+        .route("/api/nacos/configs/publish", post(|| async { "published" }))
+        .route("/api/etcd/compact", post(|| async { "compacted" }))
+        .route("/api/document-store/find-documents", post(|| async { "documents" }))
         .fallback(|| async { "handled" })
+        .layer(middleware::from_fn_with_state(state.clone(), crate::engine_access::engine_access_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1020,4 +1025,71 @@ async fn administrators_list_and_revoke_sessions() {
     let rows = audit_rows(&state, 5).await;
     assert!(rows.iter().any(|row| row.event == "session_revoked"));
     assert!(rows.iter().any(|row| row.event == "user_sessions_revoked"));
+}
+
+#[tokio::test]
+async fn non_sql_engines_require_the_operation_of_each_action() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    state.app.authz.set_enforced(true);
+    create_user(&state, "ana", "ana-password", false).await;
+    create_user(&state, "bob", "bob-password", false).await;
+    create_user(&state, "eva", "eva-password", false).await;
+    save_sqlite_connection(&state, "nacos", directory.path()).await;
+    save_sqlite_connection(&state, "docs", directory.path()).await;
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let ana = server.login("ana", "ana-password").await.cookie.unwrap();
+    let bob = server.login("bob", "bob-password").await.cookie.unwrap();
+    let eva = server.login("eva", "eva-password").await.cookie.unwrap();
+    server.get("/api/connection/list", Some(&admin)).await;
+    for (user, connection, role, database) in [
+        ("ana", "nacos", "builtin:reader", None),
+        ("eva", "nacos", "builtin:editor", None),
+        ("ana", "docs", "builtin:reader", Some("app")),
+    ] {
+        let id = state.app.storage.find_web_user_by_username(user).await.unwrap().unwrap().id;
+        let mut value = json!({ "connectionId": connection });
+        if let Some(database) = database {
+            value["database"] = json!(database);
+        }
+        let saved = server
+            .post(
+                "/api/admin/grants/save",
+                Some(&admin),
+                json!({
+                    "subject": { "kind": "user", "id": id },
+                    "scope": { "kind": "resource", "value": value },
+                    "effect": "allow",
+                    "role_id": role
+                }),
+            )
+            .await;
+        assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+    }
+    let call = |path: &'static str, cookie: String, body: Value| {
+        let server = &server;
+        async move { server.post(path, Some(&cookie), body).await }
+    };
+    let nacos = json!({ "connectionId": "nacos", "dataId": "app.yaml" });
+
+    assert_eq!(call("/api/nacos/configs/get", ana.clone(), nacos.clone()).await.body, "config");
+    let denied = call("/api/nacos/configs/publish", ana.clone(), nacos.clone()).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    assert!(denied.body.to_string().contains("INSERT, UPDATE required on nacos"), "{:?}", denied.body);
+    assert_eq!(call("/api/nacos/configs/publish", eva.clone(), nacos.clone()).await.body, "published");
+    assert_eq!(call("/api/nacos/configs/get", bob.clone(), nacos.clone()).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        call("/api/etcd/compact", eva.clone(), json!({ "connectionId": "nacos" })).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(call("/api/etcd/compact", admin.clone(), json!({ "connectionId": "nacos" })).await.body, "compacted");
+    assert_eq!(call("/api/nacos/configs/get", ana.clone(), json!({})).await.status, StatusCode::FORBIDDEN);
+
+    let docs = |database: &str| json!({ "connectionId": "docs", "database": database, "collection": "orders" });
+    assert_eq!(call("/api/document-store/find-documents", ana.clone(), docs("app")).await.body, "documents");
+    assert_eq!(
+        call("/api/document-store/find-documents", ana.clone(), docs("billing")).await.status,
+        StatusCode::FORBIDDEN
+    );
 }

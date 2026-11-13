@@ -465,7 +465,7 @@ pub(crate) struct DeletePolicyReq {
 // ---- Helper: writable check ----
 
 async fn ensure_writable(app: &dbx_core::connection::AppState, conn_id: &str, action: &str) -> Result<(), AppError> {
-    if let Some(name) = dbx_core::query::connection_readonly_name(app, conn_id).await {
+    if let Some(name) = dbx_core::query::read_only_protection_name(app, conn_id).await {
         return Err(AppError::from(format!("Read-only connection '{name}'. {action} is blocked.")));
     }
     Ok(())

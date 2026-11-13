@@ -33,7 +33,7 @@ async fn ensure_writable(
     connection_id: &str,
     action: &str,
 ) -> Result<(), AppError> {
-    if let Some(name) = dbx_core::query::connection_readonly_name(app, connection_id).await {
+    if let Some(name) = dbx_core::query::read_only_protection_name(app, connection_id).await {
         return Err(AppError::from(format!(
             "Read-only mode: connection '{}' has read-only protection enabled. {} blocked.",
             name, action

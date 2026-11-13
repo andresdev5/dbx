@@ -768,10 +768,42 @@ async fn require_write(state: &AppState, binding: &super::service::BoundContext)
     if !state.configs.read().await.contains_key(&binding.context.scope.connection_id) {
         return Err("native_job_connection_missing");
     }
-    if crate::query::connection_readonly_name(state, &binding.context.scope.connection_id).await.is_some() {
+    if crate::query::read_only_protection_name(state, &binding.context.scope.connection_id).await.is_some() {
         return Err("native_job_connection_read_only");
     }
+    if let Err(message) = crate::authz::authorize_any_write(state, &binding.context.scope.connection_id).await {
+        log::info!("Native job write rejected: {message}");
+        return Err("native_job_permission_denied");
+    }
     Ok(())
+}
+
+fn job_operations(action: &PreparedAction) -> dbx_authz::Operations {
+    use dbx_authz::Operations;
+    match action {
+        PreparedAction::LegacyCreate { .. }
+        | PreparedAction::SchedulerCreate { .. }
+        | PreparedAction::DamengCreate { .. } => Operations::CREATE,
+        PreparedAction::Mutation { mutation, .. } | PreparedAction::SchedulerTransition { mutation, .. } => {
+            match &mutation.change {
+                NativeJobChange::Run | NativeJobChange::Stop { .. } => Operations::EXECUTE,
+                NativeJobChange::Drop { .. } => Operations::DROP,
+                NativeJobChange::ClearHistory => Operations::DELETE,
+                _ => Operations::ALTER,
+            }
+        }
+    }
+}
+
+async fn require_job_operations(state: &AppState, execution: &PreparedExecution) -> Result<(), &'static str> {
+    let scope = &execution.binding.context.scope;
+    let operations = job_operations(&execution.action);
+    crate::authz::authorize_resource(state, &scope.connection_id, Some(&scope.database), None, None, operations, true)
+        .await
+        .map_err(|message| {
+            log::info!("Native job operation rejected: {message}");
+            "native_job_permission_denied"
+        })
 }
 
 async fn run_claimed(
@@ -824,6 +856,9 @@ async fn run_claimed(
             guard = lock.clone().lock_owned() => guard,
         }); } }
         require_write(state, &execution.binding).await.map_err(|reason| (reason, NativeJobOperationOutcome::NotApplied))?;
+        require_job_operations(state, &execution)
+            .await
+            .map_err(|reason| (reason, NativeJobOperationOutcome::NotApplied))?;
         if matches!(&execution.action, PreparedAction::LegacyCreate { .. }) {
             return legacy::run_create(state, &execution, id, &cancel, session, &mut created_job_guard, &mut dispatched).await;
         }

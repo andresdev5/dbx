@@ -946,9 +946,19 @@ pub fn pl_debug_start_submission_core(
     Ok(receipt)
 }
 async fn check_write_protection(state: &AppState, entry: &Entry, production_confirmed: bool) -> Result<(), String> {
-    if let Some(name) = super::connection_readonly_name(state, &entry.start.connection_id).await {
+    if let Some(name) = super::read_only_protection_name(state, &entry.start.connection_id).await {
         return Err(format!("Connection '{name}' is read-only; unlock writes before running or changing the debuggee"));
     }
+    crate::authz::authorize_resource(
+        state,
+        &entry.start.connection_id,
+        Some(&entry.start.database),
+        None,
+        None,
+        dbx_authz::Operations::EXECUTE,
+        true,
+    )
+    .await?;
     let configs = state.configs.read().await;
     let config = configs.get(&entry.start.connection_id).ok_or("The original connection no longer exists")?;
     if crate::production_safety::is_production_database(config, &entry.start.database) && !production_confirmed {
