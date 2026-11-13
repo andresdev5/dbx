@@ -66,6 +66,8 @@ pub enum Analysis {
 pub struct SqlRequirement {
     pub accesses: Vec<ObjectAccess>,
     pub transaction_control: bool,
+    #[serde(default)]
+    pub switches_context: bool,
     pub functions: Vec<String>,
     pub analysis: Analysis,
 }
@@ -80,7 +82,13 @@ pub struct ResolveContext<'a> {
 
 impl SqlRequirement {
     fn empty(analysis: Analysis) -> Self {
-        Self { accesses: Vec::new(), transaction_control: false, functions: Vec::new(), analysis }
+        Self {
+            accesses: Vec::new(),
+            transaction_control: false,
+            switches_context: false,
+            functions: Vec::new(),
+            analysis,
+        }
     }
 
     pub fn operations(&self) -> Operations {
@@ -106,6 +114,7 @@ impl SqlRequirement {
             self.add(access.target, access.operations);
         }
         self.transaction_control |= other.transaction_control;
+        self.switches_context |= other.switches_context;
         for function in other.functions {
             if !self.functions.contains(&function) {
                 self.functions.push(function);
@@ -972,6 +981,7 @@ impl Classifier {
     }
 
     fn use_statement(&mut self, target: &Use) {
+        self.out.switches_context = true;
         match target {
             Use::Database(name) | Use::Catalog(name) | Use::Object(name) => match name_parts(name) {
                 Some(parts) if parts.len() == 1 => {
@@ -1027,7 +1037,10 @@ impl Classifier {
             return;
         }
         match short_name(&name) {
-            "search_path" | "schema" | "current_schema" => self.schema = SchemaHint::Unknown,
+            "search_path" | "schema" | "current_schema" => {
+                self.schema = SchemaHint::Unknown;
+                self.out.switches_context = true;
+            }
             "role" | "session_authorization" | "session authorization" => self.unclassified(),
             _ => {}
         }

@@ -176,6 +176,10 @@ impl EffectivePermissions {
             .fold(Operations::empty(), |acc, candidate| acc | self.operations_at(&candidate))
     }
 
+    pub fn has_rules_below_connection(&self) -> bool {
+        self.allows.iter().chain(&self.denies).any(|rule| rule.pattern.database.is_some())
+    }
+
     pub fn is_visible(&self) -> bool {
         !self.operations_within(&Resource::connection(self.connection_id.clone())).is_empty()
     }
@@ -509,5 +513,27 @@ mod tests {
     fn foreign_connection_need_is_denied() {
         let permissions = compile(&admin(), &[], context(&[]));
         assert!(permissions.check(&Need::exact(Resource::connection("otra"), Operations::SELECT)).is_err());
+    }
+
+    #[test]
+    fn reports_rules_below_the_connection() {
+        let connection_only = vec![grant(
+            "a",
+            Subject::User("ana".into()),
+            Scope::Resource(Resource::connection("c")),
+            Effect::Allow,
+            Operations::SELECT,
+        )];
+        let context = ConnectionContext { connection_id: "c", group_path: &[], ceiling: Operations::all(), now: NOW };
+        assert!(!compile(&user(&[]), &connection_only, context).has_rules_below_connection());
+        let mut scoped = connection_only.clone();
+        scoped.push(grant(
+            "d",
+            Subject::User("ana".into()),
+            Scope::Resource(Resource::connection("c").with_database("hr")),
+            Effect::Deny,
+            Operations::SELECT,
+        ));
+        assert!(compile(&user(&[]), &scoped, context).has_rules_below_connection());
     }
 }

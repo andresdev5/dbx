@@ -520,6 +520,9 @@ async fn authorize_statements(
     for sql in statements {
         let classified = classify_sql_operations(sql, config.db_type);
         let mut requirement = classified.resolve(&context);
+        if classified.switches_context && permissions.has_rules_below_connection() {
+            requirement.push(Need::exact(Resource::connection(config.id.clone()), Operations::UNCLASSIFIED));
+        }
         if let Some(allowlist) = &strict_allowlist {
             if classified.functions.iter().any(|function| function_requires_execute(function, allowlist)) {
                 let mut resource = Resource::connection(config.id.clone());
@@ -842,6 +845,196 @@ mod tests {
         let denied = as_owner("bob-token").await.unwrap_err();
         assert!(denied.contains("no access to connection Nacos"), "{denied}");
         assert!(as_owner("ana-token").await.is_ok());
+    }
+
+    async fn engine_state(db_type: &str) -> (tempfile::TempDir, AppState) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open(&root.path().join("dbx.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, root.path().join("plugins"));
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "warehouse", "name": "Warehouse", "db_type": db_type, "host": "127.0.0.1",
+            "port": 5432, "username": "", "password": "", "database": "app",
+            "one_time": false, "save_password": false, "read_only": false
+        }))
+        .unwrap();
+        state.configs.write().await.insert("warehouse".to_string(), config);
+        (root, state)
+    }
+
+    fn deny_table(schema: Option<&str>, table: &str) -> Vec<Grant> {
+        let mut resource = Resource::connection("warehouse").with_database("app");
+        if let Some(schema) = schema {
+            resource = resource.with_schema(schema);
+        }
+        vec![
+            grant(
+                "editor",
+                Subject::User("ana".into()),
+                Scope::Resource(Resource::connection("warehouse")),
+                Effect::Allow,
+                BuiltinRole::FullEditor.operations(),
+            ),
+            grant(
+                "no-salaries",
+                Subject::User("ana".into()),
+                Scope::Resource(resource.with_table(table)),
+                Effect::Deny,
+                Operations::SELECT
+                    | Operations::INSERT
+                    | Operations::UPDATE
+                    | Operations::DELETE
+                    | Operations::TRUNCATE
+                    | Operations::ALTER
+                    | Operations::DROP
+                    | Operations::EXPORT,
+            ),
+        ]
+    }
+
+    async fn ana_may(state: &AppState, sql: &str) -> bool {
+        with_credential_owner(Some("ana-token".into()), authorize_sql_for(state, "warehouse", Some("app"), &[sql]))
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_table_deny_cannot_be_bypassed_in_postgres() {
+        let (_root, state) = engine_state("postgres").await;
+        enforce(&state, deny_table(Some("public"), "salaries"), &[]);
+        for sql in [
+            "SELECT * FROM salaries",
+            "SELECT * FROM public.salaries",
+            "SELECT * FROM PUBLIC.Salaries",
+            "SELECT * FROM \"salaries\"",
+            "SELECT * FROM app.public.salaries",
+            "SELECT e.* FROM employees e JOIN salaries s ON s.id = e.id",
+            "SELECT * FROM employees WHERE id IN (SELECT id FROM salaries)",
+            "SELECT id FROM employees UNION SELECT id FROM salaries",
+            "WITH x AS (SELECT * FROM salaries) SELECT * FROM x",
+            "SELECT * FROM employees e, LATERAL (SELECT * FROM salaries s WHERE s.id = e.id) l",
+            "INSERT INTO employees SELECT * FROM salaries",
+            "UPDATE employees SET bonus = 1 FROM salaries WHERE salaries.id = employees.id",
+            "DELETE FROM employees USING salaries WHERE salaries.id = employees.id",
+            "SELECT * FROM /* comment */ salaries",
+            "select * from salaries -- trailing comment",
+            "EXPLAIN SELECT * FROM salaries",
+            "COPY salaries TO STDOUT",
+            "TRUNCATE salaries",
+            "DROP TABLE salaries",
+            "ALTER TABLE salaries ADD COLUMN x int",
+            "CREATE TABLE copy AS SELECT * FROM salaries",
+            "SET search_path TO hr",
+        ] {
+            assert!(!ana_may(&state, sql).await, "allowed: {sql}");
+        }
+        for sql in [
+            "SELECT * FROM employees",
+            "SELECT * FROM salary_history",
+            "SELECT * FROM hr.salaries",
+            "UPDATE employees SET bonus = 1",
+        ] {
+            assert!(ana_may(&state, sql).await, "denied: {sql}");
+        }
+        let batch = with_credential_owner(
+            Some("ana-token".into()),
+            authorize_sql_for(&state, "warehouse", Some("app"), &["SELECT 1", "SELECT * FROM salaries"]),
+        )
+        .await;
+        assert!(batch.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_table_deny_cannot_be_bypassed_in_mysql() {
+        let (_root, state) = engine_state("mysql").await;
+        enforce(&state, deny_table(None, "salaries"), &[]);
+        for sql in [
+            "SELECT * FROM salaries",
+            "SELECT * FROM app.salaries",
+            "SELECT * FROM `salaries`",
+            "SELECT * FROM `app`.`SALARIES`",
+            "SELECT * FROM employees e JOIN app.salaries s ON s.id = e.id",
+            "UPDATE employees e JOIN salaries s ON s.id = e.id SET e.bonus = s.amount",
+            "DELETE e FROM employees e JOIN salaries s ON s.id = e.id",
+            "SELECT * FROM salaries INTO OUTFILE '/tmp/x'",
+            "/*!50000 SELECT * FROM salaries */",
+            "SELECT * FROM salaries LOCK IN SHARE MODE",
+            "REPLACE INTO employees SELECT * FROM salaries",
+        ] {
+            assert!(!ana_may(&state, sql).await, "allowed: {sql}");
+        }
+        for sql in ["SELECT * FROM employees", "SELECT * FROM other.salaries"] {
+            assert!(ana_may(&state, sql).await, "denied: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_the_default_database_cannot_bypass_a_table_deny() {
+        let (_root, state) = engine_state("mysql").await;
+        let mut grants = deny_table(None, "salaries");
+        grants[1].scope = Scope::Resource(Resource::connection("warehouse").with_database("hr").with_table("salaries"));
+        enforce(&state, grants, &[]);
+        assert!(!ana_may(&state, "SELECT * FROM hr.salaries").await);
+        assert!(ana_may(&state, "SELECT * FROM salaries").await);
+        assert!(!ana_may(&state, "USE hr").await, "USE must not be available to switch the default database");
+        let switched = with_credential_owner(
+            Some("ana-token".into()),
+            authorize_sql_for(&state, "warehouse", Some("app"), &["USE hr", "SELECT * FROM salaries"]),
+        )
+        .await;
+        assert!(switched.is_err());
+    }
+
+    #[tokio::test]
+    async fn switching_context_stays_available_without_finer_grained_rules() {
+        let (_root, state) = engine_state("mysql").await;
+        enforce(
+            &state,
+            vec![grant(
+                "editor",
+                Subject::User("ana".into()),
+                Scope::Resource(Resource::connection("warehouse")),
+                Effect::Allow,
+                BuiltinRole::FullEditor.operations(),
+            )],
+            &[],
+        );
+        assert!(ana_may(&state, "USE hr").await);
+        let (_root, postgres) = engine_state("postgres").await;
+        enforce(
+            &postgres,
+            vec![grant(
+                "editor",
+                Subject::User("ana".into()),
+                Scope::Resource(Resource::connection("warehouse")),
+                Effect::Allow,
+                BuiltinRole::FullEditor.operations(),
+            )],
+            &[],
+        );
+        assert!(ana_may(&postgres, "SET search_path TO hr, public").await);
+    }
+
+    #[tokio::test]
+    async fn a_table_only_grant_does_not_open_the_rest_of_the_database() {
+        let (_root, state) = engine_state("postgres").await;
+        enforce(
+            &state,
+            vec![grant(
+                "only-orders",
+                Subject::User("ana".into()),
+                Scope::Resource(
+                    Resource::connection("warehouse").with_database("app").with_schema("public").with_table("orders"),
+                ),
+                Effect::Allow,
+                Operations::SELECT,
+            )],
+            &[],
+        );
+        assert!(ana_may(&state, "SELECT * FROM orders").await);
+        assert!(ana_may(&state, "SELECT * FROM public.orders").await);
+        assert!(!ana_may(&state, "SELECT * FROM customers").await);
+        assert!(!ana_may(&state, "SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id").await);
+        assert!(!ana_may(&state, "UPDATE orders SET status = 'x'").await);
     }
 
     #[tokio::test]
