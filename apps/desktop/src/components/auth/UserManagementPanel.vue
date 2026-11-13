@@ -4,7 +4,7 @@ import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Copy, KeyRound, Loader2, Trash2, UserPlus, UserRoundCheck, UserRoundX } from "@lucide/vue";
+import { Copy, KeyRound, Loader2, ShieldAlert, ShieldOff, Trash2, UserPlus, UserRoundCheck, UserRoundX } from "@lucide/vue";
 import { apiUrl } from "@/lib/common/webPath";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { readAuthErrorCode } from "@/lib/startup/startupAuthentication";
@@ -16,6 +16,8 @@ interface ManagedUser {
   role: "admin" | "user";
   active: boolean;
   must_change_password: boolean;
+  mfa_enabled: boolean;
+  mfa_required: boolean;
   last_login_at: number | null;
   created_at: number;
 }
@@ -35,6 +37,8 @@ const newDisplayName = ref("");
 const newRole = ref<"admin" | "user">("user");
 const newPassword = ref("");
 const creating = ref(false);
+const mfaRequiredAll = ref(false);
+const savingPolicy = ref(false);
 
 async function call<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(apiUrl(`/api/admin/users/${path}`), {
@@ -54,7 +58,9 @@ async function refresh() {
   loading.value = true;
   error.value = "";
   try {
-    users.value = await call<ManagedUser[]>("list", {});
+    const [loadedUsers, policy] = await Promise.all([call<ManagedUser[]>("list", {}), call<{ required_all: boolean }>("mfa-policy", {})]);
+    users.value = loadedUsers;
+    mfaRequiredAll.value = policy.required_all;
   } catch (e: any) {
     error.value = e?.message || t("users.actionFailed");
   } finally {
@@ -124,6 +130,33 @@ function resetPassword(user: ManagedUser) {
   });
 }
 
+function toggleMfaRequired(user: ManagedUser) {
+  void runOnUser(user, async () => replaceUser(await call<ManagedUser>("set-mfa-required", { id: user.id, required: !user.mfa_required })));
+}
+
+function resetMfa(user: ManagedUser) {
+  if (!window.confirm(t("mfa.confirmReset", { username: user.username }))) return;
+  void runOnUser(user, async () => replaceUser(await call<ManagedUser>("reset-mfa", { id: user.id })));
+}
+
+async function changeMfaPolicy(requiredAll: boolean) {
+  if (!window.confirm(requiredAll ? t("mfa.confirmRequireAll") : t("mfa.confirmUnrequireAll"))) {
+    mfaRequiredAll.value = !requiredAll;
+    return;
+  }
+  savingPolicy.value = true;
+  error.value = "";
+  try {
+    mfaRequiredAll.value = (await call<{ required_all: boolean }>("mfa-policy/save", { required_all: requiredAll })).required_all;
+    users.value = await call<ManagedUser[]>("list", {});
+  } catch (e: any) {
+    mfaRequiredAll.value = !requiredAll;
+    error.value = e?.message || t("users.actionFailed");
+  } finally {
+    savingPolicy.value = false;
+  }
+}
+
 function deleteUser(user: ManagedUser) {
   if (!window.confirm(t("users.confirmDelete", { username: user.username }))) return;
   void runOnUser(user, async () => {
@@ -171,6 +204,11 @@ onMounted(() => {
 
     <p v-if="error" class="text-sm text-destructive" data-testid="user-management-error">{{ error }}</p>
 
+    <label class="flex items-center gap-2 text-sm">
+      <input v-model="mfaRequiredAll" type="checkbox" :disabled="savingPolicy || loading" data-testid="mfa-required-all" @change="changeMfaPolicy(mfaRequiredAll)" />
+      {{ t("mfa.requireAll") }}
+    </label>
+
     <div class="overflow-hidden rounded-md border border-border/60">
       <div v-if="loading" class="flex items-center gap-2 px-3 py-4 text-sm text-muted-foreground">
         <Loader2 class="h-4 w-4 animate-spin" />
@@ -181,9 +219,13 @@ onMounted(() => {
           <p class="truncate text-sm font-medium">
             {{ user.display_name || user.username }}
             <span v-if="user.id === props.currentUserId" class="text-xs font-normal text-muted-foreground">{{ t("users.you") }}</span>
+            <span :class="['ml-1 rounded px-1.5 py-0.5 text-xs font-medium', user.mfa_enabled ? 'bg-green-500/15 text-green-600' : 'bg-amber-500/15 text-amber-600']" data-testid="mfa-badge">
+              {{ user.mfa_enabled ? t("mfa.badgeOn") : t("mfa.badgeOff") }}
+            </span>
           </p>
           <p class="truncate text-xs text-muted-foreground">
-            {{ user.username }} · {{ user.active ? t("users.active") : t("users.disabled") }}<template v-if="user.must_change_password"> · {{ t("users.mustChange") }}</template> · {{ t("users.lastLogin") }}: {{ lastLogin(user) }}
+            {{ user.username }} · {{ user.active ? t("users.active") : t("users.disabled") }}<template v-if="user.must_change_password"> · {{ t("users.mustChange") }}</template
+            ><template v-if="user.mfa_required"> · {{ t("mfa.requiredShort") }}</template> · {{ t("users.lastLogin") }}: {{ lastLogin(user) }}
           </p>
         </div>
         <select
@@ -203,6 +245,12 @@ onMounted(() => {
           </Button>
           <Button variant="ghost" size="icon" class="h-8 w-8" :title="t('users.resetPassword')" :disabled="busyUserId === user.id" @click="resetPassword(user)">
             <KeyRound class="h-4 w-4" />
+          </Button>
+          <Button variant="ghost" size="icon" :class="['h-8 w-8', user.mfa_required ? 'text-amber-600' : '']" :title="user.mfa_required ? t('mfa.unrequireUser') : t('mfa.requireUser')" :disabled="busyUserId === user.id" data-testid="mfa-toggle-required" @click="toggleMfaRequired(user)">
+            <ShieldAlert class="h-4 w-4" />
+          </Button>
+          <Button v-if="user.mfa_enabled" variant="ghost" size="icon" class="h-8 w-8" :title="t('mfa.reset')" :disabled="busyUserId === user.id" data-testid="mfa-reset" @click="resetMfa(user)">
+            <ShieldOff class="h-4 w-4" />
           </Button>
           <Button variant="ghost" size="icon" class="h-8 w-8 text-destructive hover:text-destructive" :title="t('users.delete')" :disabled="busyUserId === user.id" @click="deleteUser(user)">
             <Trash2 class="h-4 w-4" />

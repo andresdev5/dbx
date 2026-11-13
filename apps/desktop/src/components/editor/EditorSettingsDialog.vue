@@ -356,6 +356,7 @@ import ChangelogPanel from "@/components/settings/ChangelogPanel.vue";
 import WebLoginCaptchaSetting from "@/components/settings/WebLoginCaptchaSetting.vue";
 import UserManagementPanel from "@/components/auth/UserManagementPanel.vue";
 import AccessControlPanel from "@/components/auth/access/AccessControlPanel.vue";
+import MfaAccountCard from "@/components/auth/mfa/MfaAccountCard.vue";
 import AuditLogPanel from "@/components/auth/audit/AuditLogPanel.vue";
 import SessionsPanel from "@/components/auth/audit/SessionsPanel.vue";
 import SettingsTransferPanel from "@/components/settings/SettingsTransferPanel.vue";
@@ -14006,6 +14007,9 @@ LIMIT 100;</pre>
                   <p class="truncate text-sm font-medium">{{ signedInUser.display_name || signedInUser.username }}</p>
                   <p class="text-xs text-muted-foreground">{{ t("auth.signedInAs", { username: signedInUser.username }) }} · {{ signedInUser.role === "admin" ? t("auth.roleAdmin") : t("auth.roleUser") }}</p>
                 </div>
+              </div>
+              <div v-if="signedInUser" class="border-b border-border/60 pb-5">
+                <MfaAccountCard :username="signedInUser.username" />
               </div>
               <div class="space-y-3">
                 <Label class="text-base">{{ t("auth.changePassword") }}</Label>

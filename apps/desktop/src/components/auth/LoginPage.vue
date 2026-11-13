@@ -4,10 +4,11 @@ import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import PasswordInput from "@/components/ui/PasswordInput.vue";
-import { KeyRound, Lock, Loader2, ShieldCheck, ShieldQuestion, User } from "@lucide/vue";
+import { ArrowLeft, KeyRound, Lock, Loader2, ShieldCheck, ShieldQuestion, Smartphone, User } from "@lucide/vue";
 import AppLogo from "@/components/icons/AppLogo.vue";
 import { apiUrl } from "@/lib/common/webPath";
 import { translateBackendError } from "@/i18n/backend-errors";
+import { mfa } from "@/lib/auth/mfa";
 
 const props = withDefaults(
   defineProps<{
@@ -16,7 +17,7 @@ const props = withDefaults(
   { setupMode: false },
 );
 
-const emit = defineEmits<{ authenticated: [result: { mustChangePassword: boolean }] }>();
+const emit = defineEmits<{ authenticated: [result: { mustChangePassword: boolean; mfaSetupRequired?: boolean }] }>();
 const { t } = useI18n();
 
 const username = ref("");
@@ -30,6 +31,8 @@ const captchaImage = ref("");
 const captchaLoading = ref(false);
 const error = ref("");
 const loading = ref(false);
+const mfaChallenge = ref("");
+const mfaCode = ref("");
 
 // The auth routes report failures as `{"error": "..."}`, so unwrap that before
 // translating; anything else is treated as a plain-text message.
@@ -113,8 +116,13 @@ async function submit() {
       body: JSON.stringify(payload),
     });
     if (res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { must_change_password?: boolean };
-      emit("authenticated", { mustChangePassword: body.must_change_password === true });
+      const body = (await res.json().catch(() => ({}))) as { must_change_password?: boolean; mfa_setup_required?: boolean; mfa_required?: boolean; challenge?: string };
+      if (body.mfa_required && body.challenge) {
+        mfaChallenge.value = body.challenge;
+        mfaCode.value = "";
+        return;
+      }
+      emit("authenticated", { mustChangePassword: body.must_change_password === true, mfaSetupRequired: body.mfa_setup_required === true });
     } else {
       error.value = await readAuthError(res);
       if (!props.setupMode) await refreshCaptcha();
@@ -125,6 +133,30 @@ async function submit() {
   } finally {
     loading.value = false;
   }
+}
+
+async function submitMfa() {
+  loading.value = true;
+  error.value = "";
+  try {
+    const body = await mfa.verifyLogin(mfaChallenge.value, mfaCode.value.trim());
+    emit("authenticated", { mustChangePassword: body.must_change_password === true, mfaSetupRequired: body.mfa_setup_required === true });
+  } catch (e: any) {
+    const code = e?.message ?? "";
+    error.value = translateBackendError(t, code) || t("auth.loginFailed");
+    mfaCode.value = "";
+    if (code === "mfa_challenge_expired") restartLogin(false);
+  } finally {
+    loading.value = false;
+  }
+}
+
+function restartLogin(clearError = true) {
+  mfaChallenge.value = "";
+  mfaCode.value = "";
+  password.value = "";
+  if (clearError) error.value = "";
+  void refreshCaptcha();
 }
 
 onMounted(() => {
@@ -145,7 +177,28 @@ onMounted(() => {
         </div>
       </div>
 
-      <form class="space-y-4" @submit.prevent="submit" autocomplete="off">
+      <form v-if="mfaChallenge" class="space-y-4" autocomplete="off" data-testid="mfa-login-form" @submit.prevent="submitMfa">
+        <div class="flex items-center justify-center gap-2 text-sm text-muted-foreground">
+          <Smartphone class="w-4 h-4" />
+          <span>{{ t("mfa.loginTitle") }}</span>
+        </div>
+        <p class="text-center text-xs text-muted-foreground">{{ t("mfa.loginHint") }}</p>
+        <div class="relative">
+          <ShieldCheck class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+          <Input v-model="mfaCode" :placeholder="t('mfa.loginPlaceholder')" class="pl-10 h-11 tracking-[0.3em]" inputmode="text" autocomplete="one-time-code" maxlength="20" autofocus data-testid="mfa-login-code" />
+        </div>
+        <p v-if="error" class="text-sm text-destructive text-center">{{ error }}</p>
+        <Button type="submit" class="w-full h-11 text-sm font-medium" :disabled="loading || mfaCode.trim().length < 6" data-testid="mfa-login-submit">
+          <Loader2 v-if="loading" class="w-4 h-4 animate-spin mr-2" />
+          {{ loading ? t("auth.processing") : t("mfa.verify") }}
+        </Button>
+        <Button type="button" variant="ghost" class="w-full gap-2 text-muted-foreground" @click="restartLogin()">
+          <ArrowLeft class="w-4 h-4" />
+          {{ t("mfa.backToLogin") }}
+        </Button>
+      </form>
+
+      <form v-else class="space-y-4" @submit.prevent="submit" autocomplete="off">
         <div v-if="setupMode" class="flex items-center justify-center gap-2 text-sm text-muted-foreground">
           <ShieldCheck class="w-4 h-4" />
           <span>{{ t("auth.setupTitle") }}</span>

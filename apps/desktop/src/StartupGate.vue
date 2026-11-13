@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { defineAsyncComponent, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
+import { dismissMfaRecommendation, mfaRecommendationDismissed } from "@/lib/auth/mfaRecommendation";
 import { useI18n } from "vue-i18n";
 import StartupLoading from "@/components/layout/StartupLoading.vue";
 import { useMigrationStore } from "@/stores/migrationStore";
@@ -26,6 +27,7 @@ const startupAsyncOptions = {
 const App = defineAsyncComponent({ ...startupAsyncOptions, loader: () => import("./App.vue") });
 const LoginPage = defineAsyncComponent({ ...startupAsyncOptions, loader: () => import("@/components/auth/LoginPage.vue") });
 const ForcePasswordChange = defineAsyncComponent({ ...startupAsyncOptions, loader: () => import("@/components/auth/ForcePasswordChange.vue") });
+const MfaGate = defineAsyncComponent({ ...startupAsyncOptions, loader: () => import("@/components/auth/mfa/MfaGate.vue") });
 const SecurityMigrationWizard = defineAsyncComponent({ ...startupAsyncOptions, loader: () => import("@/components/migration/SecurityMigrationWizard.vue") });
 const props = defineProps<{ localeReady?: Promise<void> }>();
 const { t } = useI18n();
@@ -35,6 +37,7 @@ const checkingAuth = ref(true);
 const loginRequired = ref(false);
 const setupRequired = ref(false);
 const passwordChangeRequired = ref(false);
+const mfaGate = ref<"forced" | "recommended" | null>(null);
 const authFailed = ref(false);
 const startupAuthentication = shallowRef<StartupAuthentication>();
 const checkingLocale = ref(Boolean(props.localeReady));
@@ -80,6 +83,16 @@ async function initialize() {
         return;
       }
       if (passwordChangeRequired.value) return;
+      const user = result.user;
+      mfaGate.value = null;
+      if (user?.mfa_setup_required) {
+        mfaGate.value = "forced";
+        return;
+      }
+      if (result.required && user && !user.mfa_enabled && !mfaRecommendationDismissed(user.id, user.role === "admin")) {
+        mfaGate.value = "recommended";
+        return;
+      }
       await initializePasswordViewerCapability();
     } else {
       await initializePasswordViewerCapability();
@@ -92,6 +105,18 @@ async function initialize() {
     if (!request.signal.aborted) checkingAuth.value = false;
   }
 }
+function skipMfaRecommendation() {
+  const user = startupAuthentication.value?.user;
+  if (user) dismissMfaRecommendation(user.id, user.role === "admin");
+  void initialize();
+}
+
+function mfaEnabled() {
+  const user = startupAuthentication.value?.user;
+  if (user) dismissMfaRecommendation(user.id, user.role === "admin");
+  void initialize();
+}
+
 async function authenticated() {
   history.replaceState(null, "", webPath("/"));
   await initialize();
@@ -106,6 +131,7 @@ onUnmounted(() => authRequest?.abort());
   <StartupLoading v-if="checkingLocale || localeFailed || checkingAuth || authFailed" :label="authFailed ? t('migration.authFailed') : !checkingLocale && !localeFailed ? t('migration.checking') : undefined" :error="localeFailed || authFailed" :retry="localeFailed ? initializeLocale : initialize" />
   <LoginPage v-else-if="loginRequired" :setup-mode="setupRequired" @authenticated="authenticated" />
   <ForcePasswordChange v-else-if="passwordChangeRequired" :username="startupAuthentication?.user?.username" @changed="initialize" @logged-out="initialize" />
+  <MfaGate v-else-if="mfaGate" :username="startupAuthentication?.user?.username ?? ''" :forced="mfaGate === 'forced'" @done="mfaEnabled" @skip="skipMfaRecommendation" @logged-out="initialize" />
   <SecurityMigrationWizard v-else-if="blocking" :store="migration" />
   <App v-else :startup-authentication="startupAuthentication" />
 </template>

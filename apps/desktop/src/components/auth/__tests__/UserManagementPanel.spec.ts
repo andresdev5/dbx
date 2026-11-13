@@ -52,6 +52,10 @@ describe("UserManagementPanel", () => {
         return jsonResponse({ user: { ...ANA, id: "u-bob", username: body.username, display_name: null }, temporary_password: "Temp-Pass-123" }, 201);
       }
       if (path === "set-active") return jsonResponse({ ...ANA, active: body.active });
+      if (path === "mfa-policy") return jsonResponse({ required_all: false });
+      if (path === "mfa-policy/save") return jsonResponse({ required_all: body.required_all });
+      if (path === "set-mfa-required") return jsonResponse({ ...ANA, mfa_enabled: true, mfa_required: body.required });
+      if (path === "reset-mfa") return jsonResponse({ ...ANA, mfa_enabled: false });
       return jsonResponse({ ok: true });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -72,7 +76,8 @@ describe("UserManagementPanel", () => {
     expect(rows[0].querySelector<HTMLSelectElement>("select")!.disabled).toBe(true);
     expect(rows[1].textContent).toContain("Ana");
     expect(rows[1].textContent).toContain("users.mustChange");
-    expect(rows[1].querySelectorAll("button")).toHaveLength(3);
+    expect(rows[1].querySelectorAll("button")).toHaveLength(4);
+    expect(rows[0].querySelector('[data-testid="mfa-badge"]')!.textContent).toContain("mfa.badgeOff");
     app.unmount();
   });
 
@@ -108,6 +113,43 @@ describe("UserManagementPanel", () => {
     await flush();
     expect(requests.find((request) => request.path === "set-active")?.body).toEqual({ id: ANA.id, active: false });
     expect(root.querySelectorAll('[data-testid="managed-user"]')[1].textContent).toContain("users.disabled");
+    app.unmount();
+  });
+
+  it("should show two-factor status and manage the requirement", async () => {
+    vi.stubGlobal("confirm", () => true);
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input).split("/api/admin/users/")[1];
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      requests.push({ path, body });
+      if (path === "list") return jsonResponse([ADMIN, { ...ANA, mfa_enabled: true, mfa_required: false }]);
+      if (path === "mfa-policy") return jsonResponse({ required_all: false });
+      if (path === "mfa-policy/save") return jsonResponse({ required_all: body.required_all });
+      if (path === "set-mfa-required") return jsonResponse({ ...ANA, mfa_enabled: true, mfa_required: body.required });
+      if (path === "reset-mfa") return jsonResponse({ ...ANA, mfa_enabled: false, mfa_required: true });
+      return jsonResponse({ ok: true });
+    });
+    const { root, app } = mount();
+    await flush();
+    const ana = () => root.querySelectorAll('[data-testid="managed-user"]')[1];
+    expect(ana().querySelector('[data-testid="mfa-badge"]')!.textContent).toContain("mfa.badgeOn");
+
+    ana().querySelector<HTMLButtonElement>('[data-testid="mfa-toggle-required"]')!.click();
+    await flush();
+    expect(requests.find((request) => request.path === "set-mfa-required")?.body).toEqual({ id: "u-ana", required: true });
+    expect(ana().textContent).toContain("mfa.requiredShort");
+
+    ana().querySelector<HTMLButtonElement>('[data-testid="mfa-reset"]')!.click();
+    await flush();
+    expect(requests.find((request) => request.path === "reset-mfa")?.body).toEqual({ id: "u-ana" });
+    expect(ana().querySelector('[data-testid="mfa-badge"]')!.textContent).toContain("mfa.badgeOff");
+    expect(ana().querySelector('[data-testid="mfa-reset"]')).toBeNull();
+
+    const requireAll = root.querySelector<HTMLInputElement>('[data-testid="mfa-required-all"]')!;
+    requireAll.checked = true;
+    requireAll.dispatchEvent(new Event("change"));
+    await flush();
+    expect(requests.find((request) => request.path === "mfa-policy/save")?.body).toEqual({ required_all: true });
     app.unmount();
   });
 });

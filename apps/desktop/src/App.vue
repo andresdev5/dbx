@@ -5072,8 +5072,8 @@ async function handleKeydown(e: KeyboardEvent) {
   }
 }
 
-function onLoginSuccess(result?: { mustChangePassword: boolean }) {
-  if (result?.mustChangePassword) {
+function onLoginSuccess(result?: { mustChangePassword: boolean; mfaSetupRequired?: boolean }) {
+  if (result?.mustChangePassword || result?.mfaSetupRequired) {
     window.location.replace(webPath("/"));
     return;
   }

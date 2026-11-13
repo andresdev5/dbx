@@ -6,6 +6,8 @@ export interface WebUser {
   display_name: string | null;
   role: "admin" | "user";
   must_change_password: boolean;
+  mfa_setup_required: boolean;
+  mfa_enabled: boolean;
 }
 
 export interface StartupAuthentication {
@@ -25,6 +27,8 @@ function parseWebUser(value: unknown): WebUser | undefined {
     display_name: typeof user.display_name === "string" ? user.display_name : null,
     role: user.role === "admin" ? "admin" : "user",
     must_change_password: user.must_change_password === true,
+    mfa_setup_required: user.mfa_setup_required === true,
+    mfa_enabled: user.mfa_enabled === true,
   };
 }
 

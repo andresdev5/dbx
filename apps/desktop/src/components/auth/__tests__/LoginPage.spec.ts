@@ -186,7 +186,45 @@ describe("LoginPage captcha", () => {
     await nextTick();
     root.querySelector("form")!.dispatchEvent(new Event("submit"));
     await flush();
-    expect(authenticated).toHaveBeenCalledWith({ mustChangePassword: true });
+    expect(authenticated).toHaveBeenCalledWith({ mustChangePassword: true, mfaSetupRequired: false });
+    app.unmount();
+  });
+
+  it("should ask for the second factor before finishing the sign-in", async () => {
+    const requests: { url: string; body: any }[] = [];
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/api/auth/captcha")) return new Response(null, { status: 204 });
+      requests.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (url.includes("/api/auth/login")) return jsonResponse({ ok: false, mfa_required: true, challenge: "challenge-token" });
+      if (requests.filter((request) => request.url.includes("/api/auth/mfa/verify")).length === 1) return jsonResponse({ error: "mfa_code_invalid" }, 401);
+      return jsonResponse({ ok: true, must_change_password: false, mfa_setup_required: false });
+    });
+    const authenticated = vi.fn();
+    const { root, app } = mount({ onAuthenticated: authenticated });
+    await flush();
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="username-input"]')!, "ana");
+    typeInto(root.querySelector<HTMLInputElement>('input[type="password"]')!, "secret");
+    await nextTick();
+    root.querySelector("form")!.dispatchEvent(new Event("submit"));
+    await flush();
+    expect(authenticated).not.toHaveBeenCalled();
+    const form = root.querySelector<HTMLFormElement>('[data-testid="mfa-login-form"]')!;
+    expect(form).not.toBeNull();
+
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="mfa-login-code"]')!, "000000");
+    await nextTick();
+    form.dispatchEvent(new Event("submit"));
+    await flush();
+    expect(root.textContent).toContain("mfa.errors.codeInvalid");
+    expect(authenticated).not.toHaveBeenCalled();
+
+    typeInto(root.querySelector<HTMLInputElement>('[data-testid="mfa-login-code"]')!, "123 456");
+    await nextTick();
+    root.querySelector<HTMLFormElement>('[data-testid="mfa-login-form"]')!.dispatchEvent(new Event("submit"));
+    await flush();
+    expect(requests.at(-1)).toEqual({ url: expect.stringContaining("/api/auth/mfa/verify"), body: { challenge: "challenge-token", code: "123 456" } });
+    expect(authenticated).toHaveBeenCalledWith({ mustChangePassword: false, mfaSetupRequired: false });
     app.unmount();
   });
 
