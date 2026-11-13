@@ -390,6 +390,9 @@ pub async fn save_grant(
     if operations.is_some_and(|operations| operations.is_empty()) {
         return Err(AccessError::new(StatusCode::BAD_REQUEST, "grant_invalid"));
     }
+    if body.expires_at.is_some_and(|expires_at| expires_at <= now_millis()) {
+        return Err(AccessError::new(StatusCode::BAD_REQUEST, "grant_expiry_past"));
+    }
     let existing_created_at = match &body.id {
         Some(id) => state
             .app

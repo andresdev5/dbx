@@ -221,6 +221,7 @@ const patterns: [RegExp, string][] = [
   [/^role_builtin$/, "access.errors.roleBuiltin"],
   [/^grant_not_found$/, "access.errors.grantNotFound"],
   [/^grant_invalid$/, "access.errors.grantInvalid"],
+  [/^grant_expiry_past$/, "access.errors.grantExpiryPast"],
   [/^subject_not_found$/, "access.errors.subjectNotFound"],
   [/^connection_not_found$/, "access.errors.connectionNotFound"],
   [/^operation_invalid$/, "access.errors.operationInvalid"],

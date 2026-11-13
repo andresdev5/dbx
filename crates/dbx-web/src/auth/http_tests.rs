@@ -669,6 +669,14 @@ async fn custom_roles_and_grant_validation() {
         )
         .await;
     assert_eq!(incoherent.body["error"], "grant_invalid");
+    let already_expired = server
+        .post(
+            "/api/admin/grants/save",
+            Some(&admin),
+            json!({ "subject": { "kind": "system" }, "scope": { "kind": "resource", "value": { "connectionId": "ventas" } }, "effect": "allow", "operations": ["SELECT"], "expires_at": now_millis() - 1000 }),
+        )
+        .await;
+    assert_eq!(already_expired.body["error"], "grant_expiry_past");
     let system = server
         .post(
             "/api/admin/grants/save",

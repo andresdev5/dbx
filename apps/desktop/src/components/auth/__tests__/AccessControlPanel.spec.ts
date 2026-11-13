@@ -68,10 +68,12 @@ async function openSection(root: HTMLElement, section: string) {
 describe("AccessControlPanel", () => {
   let requests: { path: string; body: any }[];
   let grantResponse: () => Response;
+  let grantList: unknown[];
 
   beforeEach(() => {
     requests = [];
     grantResponse = () => jsonResponse({ ...GRANTS[0], id: "g-new" });
+    grantList = GRANTS;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -82,7 +84,11 @@ describe("AccessControlPanel", () => {
         if (path === "admin/users/list") return jsonResponse([ADMIN, ANA]);
         if (path === "admin/groups/list") return jsonResponse([ANALYSTS]);
         if (path === "admin/roles/list") return jsonResponse(ROLES);
-        if (path === "admin/grants/list") return jsonResponse(GRANTS);
+        if (path === "admin/grants/list") return jsonResponse(grantList);
+        if (path === "admin/grants/delete") {
+          grantList = (grantList as { id: string }[]).filter((grant) => grant.id !== body.id);
+          return jsonResponse({ ok: true });
+        }
         if (path === "admin/grants/save") return grantResponse();
         if (path === "admin/grants/effective")
           return jsonResponse({
@@ -177,6 +183,41 @@ describe("AccessControlPanel", () => {
     await flush();
     expect(requests.find((request) => request.path === "admin/grants/save")?.body.subject).toEqual({ kind: "system" });
     expect(byTestId(root, "access-grants").textContent).toContain("access.errors.subjectNotFound");
+    app.unmount();
+  });
+
+  it("should mark expired grants and remove them together", async () => {
+    vi.stubGlobal("confirm", () => true);
+    grantList = [...GRANTS, { ...GRANTS[1], id: "g-old", expires_at: Date.now() - 86_400_000, note: null }];
+    const { root, app } = mount();
+    await flush();
+    const rows = root.querySelectorAll('[data-testid="access-grant"]');
+    expect(rows).toHaveLength(3);
+    expect(rows[2].querySelector('[data-testid="grant-expired"]')).not.toBeNull();
+    expect(rows[2].className).toContain("opacity-60");
+    expect(rows[0].querySelector('[data-testid="grant-expired"]')).toBeNull();
+    expect(byTestId(root, "grant-expired-summary").textContent).toContain('access.expiredCount:{"count":1}');
+
+    byTestId<HTMLButtonElement>(root, "grant-remove-expired").click();
+    await flush();
+    expect(requests.filter((request) => request.path === "admin/grants/delete").map((request) => request.body)).toEqual([{ id: "g-old" }]);
+    expect(root.querySelectorAll('[data-testid="access-grant"]')).toHaveLength(2);
+    expect(root.querySelector('[data-testid="grant-expired-summary"]')).toBeNull();
+    app.unmount();
+  });
+
+  it("should not save a grant that would already be expired", async () => {
+    const { root, app } = mount();
+    await flush();
+    const form = byTestId(root, "grant-form");
+    setValue(byTestId<HTMLSelectElement>(form, "grant-subject"), "u-ana");
+    setValue(byTestId<HTMLSelectElement>(form, "grant-connection"), "c-sales");
+    await flush();
+    expect(byTestId<HTMLButtonElement>(form, "grant-save").disabled).toBe(false);
+    setValue(byTestId<HTMLInputElement>(form, "grant-expires"), "2020-01-01");
+    await flush();
+    expect(byTestId<HTMLButtonElement>(form, "grant-save").disabled).toBe(true);
+    expect(byTestId(form, "grant-expiry-past").textContent).toContain("access.expiryInPast");
     app.unmount();
   });
 

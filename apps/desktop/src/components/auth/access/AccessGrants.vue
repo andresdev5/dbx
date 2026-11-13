@@ -34,6 +34,8 @@ const note = ref("");
 
 const selectClass = "h-9 w-full rounded-md border border-input bg-background px-2 text-sm";
 
+const now = ref(Date.now());
+
 const visibleGrants = computed(() => grants.value.filter((grant) => !filterConnection.value || grant.scope.kind !== "resource" || grant.scope.value.connectionId === filterConnection.value));
 
 const subjectOptions = computed(() => {
@@ -46,6 +48,7 @@ const canSave = computed(() => {
   if (subjectKind.value !== "system" && !subjectId.value) return false;
   if (scopeKind.value === "resource" && !connectionId.value) return false;
   if (scopeKind.value === "resource" && (schema.value.trim() || table.value.trim()) && !database.value.trim()) return false;
+  if (expiryInPast.value) return false;
   if (mode.value === "role") return Boolean(roleId.value);
   return operations.value.length > 0;
 });
@@ -55,6 +58,7 @@ function errorText(e: unknown): string {
 }
 
 async function load() {
+  now.value = Date.now();
   try {
     grants.value = await accessAdmin.grants();
   } catch (e) {
@@ -89,8 +93,21 @@ function grantOperations(grant: Grant): string {
   return (grant.operations ?? []).join(" · ");
 }
 
+function isExpired(grant: Grant): boolean {
+  return grant.expires_at !== null && grant.expires_at <= now.value;
+}
+
+const expiredGrants = computed(() => visibleGrants.value.filter(isExpired));
+const today = computed(() => dateInput(now.value));
+const expiryInPast = computed(() => {
+  const expiresAt = endOfDay(expiresOn.value);
+  return expiresAt !== null && expiresAt <= now.value;
+});
+
 function expiryLabel(grant: Grant): string {
-  return grant.expires_at ? t("access.expiresOn", { date: new Date(grant.expires_at).toLocaleDateString() }) : "";
+  if (!grant.expires_at) return "";
+  const date = new Date(grant.expires_at).toLocaleDateString();
+  return isExpired(grant) ? t("access.expiredOn", { date }) : t("access.expiresOn", { date });
 }
 
 function dateInput(millis: number | null): string {
@@ -186,6 +203,25 @@ async function remove(grant: Grant) {
   }
 }
 
+async function removeExpired() {
+  const expired = expiredGrants.value;
+  if (!expired.length || !window.confirm(t("access.confirmRemoveExpired", { count: expired.length }))) return;
+  busy.value = true;
+  error.value = "";
+  try {
+    for (const grant of expired) {
+      await accessAdmin.deleteGrant(grant.id);
+      if (editingId.value === grant.id) resetForm();
+    }
+    await load();
+  } catch (e) {
+    error.value = errorText(e);
+    await load();
+  } finally {
+    busy.value = false;
+  }
+}
+
 function changeSubjectKind(kind: SubjectKind) {
   subjectKind.value = kind;
   subjectId.value = "";
@@ -207,11 +243,20 @@ onMounted(() => {
         <option v-for="connection in connections" :key="connection.id" :value="connection.id">{{ connection.name }}</option>
       </select>
     </div>
+    <div v-if="expiredGrants.length" class="flex items-center justify-between gap-2 rounded-md bg-muted/40 px-3 py-2 text-sm" data-testid="grant-expired-summary">
+      <span class="text-muted-foreground">{{ t("access.expiredCount", { count: expiredGrants.length }) }}</span>
+      <Button variant="ghost" size="sm" class="h-7 text-destructive hover:text-destructive" :disabled="busy" data-testid="grant-remove-expired" @click="removeExpired">
+        {{ t("access.removeExpired") }}
+      </Button>
+    </div>
     <div class="overflow-hidden rounded-md border border-border/60">
       <p v-if="!visibleGrants.length" class="px-3 py-3 text-sm text-muted-foreground">{{ t("access.noGrants") }}</p>
-      <div v-for="grant in visibleGrants" :key="grant.id" class="flex items-center gap-2 border-b border-border/60 px-3 py-2 last:border-b-0" data-testid="access-grant">
+      <div v-for="grant in visibleGrants" :key="grant.id" :class="['flex items-center gap-2 border-b border-border/60 px-3 py-2 last:border-b-0', isExpired(grant) ? 'opacity-60' : '']" data-testid="access-grant">
         <span :class="['rounded px-1.5 py-0.5 text-xs font-medium', grant.effect === 'deny' ? 'bg-destructive/15 text-destructive' : 'bg-green-500/15 text-green-600']">
           {{ grant.effect === "deny" ? t("access.deny") : t("access.allow") }}
+        </span>
+        <span v-if="isExpired(grant)" class="rounded bg-muted px-1.5 py-0.5 text-xs font-medium text-muted-foreground" data-testid="grant-expired">
+          {{ t("access.expired") }}
         </span>
         <div class="min-w-0 flex-1">
           <p class="truncate text-sm">
@@ -306,7 +351,8 @@ onMounted(() => {
       <div class="grid gap-2 sm:grid-cols-2">
         <label class="space-y-1 text-xs text-muted-foreground">
           {{ t("access.expires") }}
-          <Input v-model="expiresOn" type="date" class="h-9" />
+          <Input v-model="expiresOn" type="date" class="h-9" :min="today" data-testid="grant-expires" />
+          <span v-if="expiryInPast" class="block text-destructive" data-testid="grant-expiry-past">{{ t("access.expiryInPast") }}</span>
         </label>
         <label class="space-y-1 text-xs text-muted-foreground">
           {{ t("access.note") }}
