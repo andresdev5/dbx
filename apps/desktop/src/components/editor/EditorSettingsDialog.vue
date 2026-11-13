@@ -358,6 +358,7 @@ import UserManagementPanel from "@/components/auth/UserManagementPanel.vue";
 import AccessControlPanel from "@/components/auth/access/AccessControlPanel.vue";
 import MfaAccountCard from "@/components/auth/mfa/MfaAccountCard.vue";
 import CaptchaProviderSetting from "@/components/auth/captcha/CaptchaProviderSetting.vue";
+import IdentityProvidersPanel from "@/components/auth/sso/IdentityProvidersPanel.vue";
 import AuditLogPanel from "@/components/auth/audit/AuditLogPanel.vue";
 import SessionsPanel from "@/components/auth/audit/SessionsPanel.vue";
 import SettingsTransferPanel from "@/components/settings/SettingsTransferPanel.vue";
@@ -14031,6 +14032,10 @@ LIMIT 100;</pre>
 
               <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
                 <AccessControlPanel />
+              </div>
+
+              <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">
+                <IdentityProvidersPanel />
               </div>
 
               <div v-if="signedInUser?.role === 'admin'" class="border-t border-border/60 pt-5">

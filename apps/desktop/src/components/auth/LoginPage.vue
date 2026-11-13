@@ -11,6 +11,7 @@ import AppLogo from "@/components/icons/AppLogo.vue";
 import { apiUrl } from "@/lib/common/webPath";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { mfa } from "@/lib/auth/mfa";
+import { oidcStartUrl, publicIdentityProviders, takeSsoError, type PublicIdentityProvider } from "@/lib/auth/identityProviders";
 
 const props = withDefaults(
   defineProps<{
@@ -37,6 +38,9 @@ const captchaRenderKey = ref(0);
 const error = ref("");
 const loading = ref(false);
 const mfaChallenge = ref("");
+const ssoProviders = ref<PublicIdentityProvider[]>([]);
+const ldapProviders = ref<PublicIdentityProvider[]>([]);
+const loginSource = ref("local");
 const mfaCode = ref("");
 
 // The auth routes report failures as `{"error": "..."}`, so unwrap that before
@@ -122,13 +126,15 @@ async function submit() {
   try {
     const url = apiUrl(props.setupMode ? "/api/auth/setup" : "/api/auth/login");
     const name = username.value.trim();
-    const payload = props.setupMode
+    const source = !props.setupMode && loginSource.value !== "local" ? { provider: loginSource.value } : {};
+    const basePayload = props.setupMode
       ? { setup_token: setupToken.value.trim(), username: name, password: password.value }
       : captchaRequired.value && externalCaptcha.value
         ? { username: name, password: password.value, captcha_token: captchaToken.value }
         : captchaRequired.value
           ? { username: name, password: password.value, captcha_id: captchaId.value, captcha_code: captchaCode.value }
           : { username: name, password: password.value };
+    const payload = { ...basePayload, ...source };
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -178,8 +184,20 @@ function restartLogin(clearError = true) {
   void refreshCaptcha();
 }
 
+function startSso(provider: PublicIdentityProvider) {
+  window.location.assign(oidcStartUrl(provider.id));
+}
+
 onMounted(() => {
   void refreshCaptcha();
+  const ssoError = takeSsoError();
+  if (ssoError) error.value = t(`sso.errors.${ssoError}`);
+  if (!props.setupMode) {
+    void publicIdentityProviders().then((providers) => {
+      ssoProviders.value = providers.filter((provider) => provider.kind === "oidc");
+      ldapProviders.value = providers.filter((provider) => provider.kind === "ldap");
+    });
+  }
 });
 </script>
 
@@ -229,6 +247,10 @@ onMounted(() => {
           </div>
           <p class="text-xs text-muted-foreground">{{ t("auth.setupTokenHint") }}</p>
         </div>
+        <select v-if="!setupMode && ldapProviders.length" v-model="loginSource" class="h-11 w-full rounded-md border border-input bg-background px-3 text-sm" :aria-label="t('sso.ldapSource')" data-testid="login-source">
+          <option value="local">{{ t("sso.localAccount") }}</option>
+          <option v-for="provider in ldapProviders" :key="provider.id" :value="provider.id">{{ provider.name }}</option>
+        </select>
         <div class="relative">
           <User class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <Input v-model="username" :placeholder="setupMode ? t('auth.newUsername') : t('auth.username')" class="pl-10 h-11" autocomplete="username" spellcheck="false" autofocus data-testid="username-input" />
@@ -266,6 +288,17 @@ onMounted(() => {
           {{ loading ? t("auth.processing") : setupMode ? t("auth.createAdmin") : t("auth.login") }}
         </Button>
       </form>
+
+      <div v-if="!setupMode && !mfaChallenge && ssoProviders.length" class="space-y-2" data-testid="sso-providers">
+        <div class="flex items-center gap-2 text-xs text-muted-foreground">
+          <span class="h-px flex-1 bg-border" />
+          {{ t("sso.or") }}
+          <span class="h-px flex-1 bg-border" />
+        </div>
+        <Button v-for="provider in ssoProviders" :key="provider.id" type="button" variant="outline" class="h-11 w-full" :data-testid="`sso-${provider.id}`" @click="startSso(provider)">
+          {{ t("sso.continueWith", { name: provider.name }) }}
+        </Button>
+      </div>
 
       <p class="text-center text-xs text-muted-foreground/50">Powered by DBX</p>
     </div>
