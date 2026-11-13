@@ -26,6 +26,7 @@ pub const INVALID_CREDENTIALS: &str = "invalid_credentials";
 pub const CROSS_SITE_REQUEST: &str = "cross_site_request";
 pub const ROUTE_NOT_CLASSIFIED: &str = "route_not_classified";
 pub const ADMIN_REQUIRED: &str = "admin_required";
+pub const MFA_SETUP_REQUIRED: &str = "mfa_setup_required";
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -73,6 +74,8 @@ pub struct AuthUserView {
     pub display_name: Option<String>,
     pub role: PlatformRole,
     pub must_change_password: bool,
+    pub mfa_setup_required: bool,
+    pub mfa_enabled: bool,
 }
 
 impl From<&SessionUser> for AuthUserView {
@@ -83,6 +86,8 @@ impl From<&SessionUser> for AuthUserView {
             display_name: user.display_name.clone(),
             role: user.role,
             must_change_password: user.must_change_password,
+            mfa_setup_required: user.mfa_setup_required,
+            mfa_enabled: user.mfa_enabled,
         }
     }
 }
@@ -100,7 +105,7 @@ pub(crate) fn error_response(status: StatusCode, code: &str) -> Response {
     (status, [("cache-control", "no-store")], Json(serde_json::json!({ "error": code }))).into_response()
 }
 
-fn rate_limited(wait: std::time::Duration) -> Response {
+pub(crate) fn rate_limited(wait: std::time::Duration) -> Response {
     let remaining = wait.as_secs().max(1);
     error_response(StatusCode::TOO_MANY_REQUESTS, &format!("Please try again in {remaining}s"))
 }
@@ -162,7 +167,7 @@ pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
 
 const MAX_AUDITED_USERNAME_CHARS: usize = 64;
 
-fn audit_auth_failure(state: &WebState, event: &str, username: &str, client: &ClientInfo, reason: &str) {
+pub(crate) fn audit_auth_failure(state: &WebState, event: &str, username: &str, client: &ClientInfo, reason: &str) {
     if !state.app.audit.is_enabled() {
         return;
     }
@@ -201,16 +206,17 @@ pub(crate) async fn forget_live_sessions_by_hash(state: &WebState, token_hashes:
     }
 }
 
-async fn start_session(
+pub(crate) async fn start_session(
     state: &WebState,
     user: &dbx_core::storage::WebUser,
     client: &ClientInfo,
     event: &str,
+    mfa_verified: bool,
 ) -> Response {
     let now = now_millis();
     let created = state
         .session_manager
-        .create(&state.app.storage, user, client.ip_string(), client.user_agent.clone(), now)
+        .create(&state.app.storage, user, client.ip_string(), client.user_agent.clone(), mfa_verified, now)
         .await;
     let (token, session_user) = match created {
         Ok(created) => created,
@@ -224,14 +230,23 @@ async fn start_session(
     }
     state.sessions.write().await.insert(token.clone());
     state.app.audit.record(
-        AuditEvent::new(event).by_user(&user.id, &user.username).session(&token).ip(client.ip_string().as_deref()),
+        AuditEvent::new(event)
+            .by_user(&user.id, &user.username)
+            .session(&token)
+            .ip(client.ip_string().as_deref())
+            .detail(serde_json::json!({ "mfa": mfa_verified })),
     );
     let cookie = session_cookie(state, &token);
     let view = AuthUserView::from(&session_user);
     (
         StatusCode::OK,
         [("set-cookie", cookie.as_str()), ("cache-control", "no-store")],
-        Json(serde_json::json!({ "ok": true, "must_change_password": view.must_change_password, "user": view })),
+        Json(serde_json::json!({
+            "ok": true,
+            "must_change_password": view.must_change_password,
+            "mfa_setup_required": view.mfa_setup_required,
+            "user": view,
+        })),
     )
         .into_response()
 }
@@ -326,7 +341,10 @@ pub async fn login(State(state): State<Arc<WebState>>, client: ClientInfo, Json(
     let Some(user) = user else {
         return error_response(StatusCode::UNAUTHORIZED, INVALID_CREDENTIALS);
     };
-    start_session(&state, &user, &client, "login_succeeded").await
+    if user.mfa_enabled {
+        return crate::routes::mfa::issue_login_challenge(&state, &user).await;
+    }
+    start_session(&state, &user, &client, "login_succeeded", false).await
 }
 
 pub async fn setup(State(state): State<Arc<WebState>>, client: ClientInfo, Json(body): Json<SetupRequest>) -> Response {
@@ -396,7 +414,7 @@ pub async fn setup(State(state): State<Arc<WebState>>, client: ClientInfo, Json(
             log::error!("Web MCP remained disabled after the first administrator was created: {error}");
         }
     }
-    start_session(&state, &user, &client, "setup_completed").await
+    start_session(&state, &user, &client, "setup_completed", false).await
 }
 
 pub async fn check(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Json<AuthCheckResponse> {
@@ -512,6 +530,10 @@ fn allowed_while_password_change_required(suffix: &str) -> bool {
     matches!(suffix, "auth/change-password" | "auth/logout")
 }
 
+fn allowed_while_mfa_setup_required(suffix: &str) -> bool {
+    matches!(suffix, "auth/mfa/status" | "auth/mfa/setup" | "auth/mfa/confirm" | "auth/logout")
+}
+
 pub async fn auth_middleware(
     State(state): State<Arc<WebState>>,
     mut req: Request<axum::body::Body>,
@@ -552,6 +574,9 @@ pub async fn auth_middleware(
     };
     if user.must_change_password && !allowed_while_password_change_required(&suffix) {
         return error_response(StatusCode::FORBIDDEN, PASSWORD_CHANGE_REQUIRED);
+    }
+    if !user.must_change_password && user.mfa_setup_required && !allowed_while_mfa_setup_required(&suffix) {
+        return error_response(StatusCode::FORBIDDEN, MFA_SETUP_REQUIRED);
     }
     if route_class == RouteClass::Admin && user.role != PlatformRole::Admin {
         return error_response(StatusCode::FORBIDDEN, ADMIN_REQUIRED);

@@ -31,6 +31,8 @@ const RULES: &[(&str, RouteClass)] = &[
     ("auth/captcha", Public),
     ("auth/change-password", Authenticated),
     ("auth/logout", Authenticated),
+    ("auth/mfa/verify", Public),
+    ("auth/mfa/**", Authenticated),
     ("admin/**", Admin),
     ("agents/**", Authenticated),
     ("WRITE agents/**", Admin),

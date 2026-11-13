@@ -133,6 +133,13 @@ async fn serve(state: Arc<WebState>) -> Server {
         .route("/api/admin/sessions/revoke", post(crate::routes::admin_audit::revoke_session))
         .route("/api/connection/list", get(crate::routes::connection::load_connections))
         .route("/api/database-backups", post(crate::routes::scheduled_backup::command))
+        .route("/api/auth/mfa/verify", post(crate::routes::mfa::verify_login))
+        .route("/api/auth/mfa/status", post(crate::routes::mfa::status))
+        .route("/api/auth/mfa/setup", post(crate::routes::mfa::setup))
+        .route("/api/auth/mfa/confirm", post(crate::routes::mfa::confirm))
+        .route("/api/auth/mfa/disable", post(crate::routes::mfa::disable))
+        .route("/api/admin/users/reset-mfa", post(crate::routes::admin_users::reset_mfa))
+        .route("/api/admin/users/set-mfa-required", post(crate::routes::admin_users::set_mfa_required))
         .route("/api/history/save", post(crate::routes::history::save_history))
         .route("/api/history/search", post(crate::routes::history::search_history))
         .route("/api/nacos/configs/get", post(|| async { "config" }))
@@ -1139,4 +1146,90 @@ async fn each_user_only_sees_their_own_query_history() {
     assert_eq!(ids(server.post("/api/history/search", Some(&ana), json!({})).await), vec!["ana-1"]);
     assert_eq!(ids(server.post("/api/history/search", Some(&bob), json!({})).await), vec!["bob-12"]);
     assert!(ids(server.post("/api/history/search", Some(&admin), json!({})).await).is_empty());
+}
+
+fn totp_code(secret: &str, offset: i64) -> String {
+    let key = data_encoding::BASE32_NOPAD.decode(secret.as_bytes()).unwrap();
+    format!("{:06}", crate::mfa::code_at(&key, crate::mfa::step_at(now_millis()) + offset))
+}
+
+#[tokio::test]
+async fn two_factor_enrollment_login_recovery_and_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = open_state(directory.path(), |_| {}).await;
+    create_user(&state, "ana", "ana-password", false).await;
+    create_user(&state, "bob", "bob-password", false).await;
+    let server = serve(state.clone()).await;
+    let admin = server.login("admin", ADMIN_PASSWORD).await.cookie.unwrap();
+    let ana = server.login("ana", "ana-password").await.cookie.unwrap();
+
+    let setup = server.post("/api/auth/mfa/setup", Some(&ana), json!({})).await;
+    assert_eq!(setup.status, StatusCode::OK, "{:?}", setup.body);
+    let secret = setup.body["secret"].as_str().unwrap().to_string();
+    assert!(setup.body["otpauth_uri"].as_str().unwrap().starts_with("otpauth://totp/DBX:ana?secret="));
+    let wrong = server.post("/api/auth/mfa/confirm", Some(&ana), json!({ "code": "000000" })).await;
+    assert_eq!(wrong.body["error"], "mfa_code_invalid");
+    let confirmed = server.post("/api/auth/mfa/confirm", Some(&ana), json!({ "code": totp_code(&secret, 0) })).await;
+    assert_eq!(confirmed.status, StatusCode::OK, "{:?}", confirmed.body);
+    let recovery: Vec<String> = confirmed.body["recovery_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|code| code.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(recovery.len(), 10);
+    let status = server.post("/api/auth/mfa/status", Some(&ana), json!({})).await;
+    assert_eq!(status.body["enabled"], true);
+    assert_eq!(status.body["recovery_codes_left"], 10);
+
+    let first = server.login("ana", "ana-password").await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert!(first.cookie.is_none());
+    assert_eq!(first.body["mfa_required"], true);
+    let challenge = first.body["challenge"].as_str().unwrap().to_string();
+    let reused = server
+        .post("/api/auth/mfa/verify", None, json!({ "challenge": challenge, "code": totp_code(&secret, 0) }))
+        .await;
+    assert_eq!(reused.body["error"], "mfa_code_invalid");
+    let verified = server
+        .post("/api/auth/mfa/verify", None, json!({ "challenge": challenge, "code": totp_code(&secret, 1) }))
+        .await;
+    assert_eq!(verified.status, StatusCode::OK, "{:?}", verified.body);
+    assert!(verified.cookie.is_some());
+    let replayed = server
+        .post("/api/auth/mfa/verify", None, json!({ "challenge": challenge, "code": totp_code(&secret, 1) }))
+        .await;
+    assert_eq!(replayed.body["error"], "mfa_challenge_expired");
+
+    let second = server.login("ana", "ana-password").await.body["challenge"].as_str().unwrap().to_string();
+    let with_recovery = server
+        .post("/api/auth/mfa/verify", None, json!({ "challenge": second, "code": recovery[0].to_uppercase() }))
+        .await;
+    assert!(with_recovery.cookie.is_some(), "{:?}", with_recovery.body);
+    let third = server.login("ana", "ana-password").await.body["challenge"].as_str().unwrap().to_string();
+    let spent = server.post("/api/auth/mfa/verify", None, json!({ "challenge": third, "code": recovery[0] })).await;
+    assert_eq!(spent.body["error"], "mfa_code_invalid");
+
+    let ana_id = state.app.storage.find_web_user_by_username("ana").await.unwrap().unwrap().id;
+    let bob_id = state.app.storage.find_web_user_by_username("bob").await.unwrap().unwrap().id;
+    server.post("/api/admin/users/set-mfa-required", Some(&admin), json!({ "id": bob_id, "required": true })).await;
+    let bob = server.login("bob", "bob-password").await;
+    assert_eq!(bob.body["mfa_setup_required"], true);
+    let bob = bob.cookie.unwrap();
+    assert_eq!(server.get("/api/query/execute", Some(&bob)).await.body["error"], "mfa_setup_required");
+    assert_eq!(server.post("/api/auth/mfa/status", Some(&bob), json!({})).await.body["setup_required"], true);
+
+    server.post("/api/admin/users/set-mfa-required", Some(&admin), json!({ "id": ana_id, "required": true })).await;
+    let blocked = server
+        .post("/api/auth/mfa/disable", Some(&ana), json!({ "password": "ana-password", "code": totp_code(&secret, 0) }))
+        .await;
+    assert_eq!(blocked.body["error"], "mfa_required_by_policy");
+
+    let reset = server.post("/api/admin/users/reset-mfa", Some(&admin), json!({ "id": ana_id })).await;
+    assert_eq!(reset.status, StatusCode::OK, "{:?}", reset.body);
+    assert_eq!(reset.body["mfa_enabled"], false);
+    let after_reset = server.login("ana", "ana-password").await;
+    assert_eq!(after_reset.body["mfa_setup_required"], true);
+    assert!(after_reset.cookie.is_some());
+    assert_eq!(verified.body["user"]["mfa_enabled"], true);
 }

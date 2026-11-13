@@ -6,6 +6,7 @@ pub use dbx_drivers::runtime_config::{
 mod type_execution_receipts;
 mod web_audit;
 mod web_grants;
+mod web_mfa;
 mod web_users;
 pub use type_execution_receipts::{TypeExecutionBinding, TypeRecoveryContext};
 pub use web_audit::{AuditEntry, AuditFilter, MAX_AUDIT_PAGE};
@@ -13,6 +14,7 @@ pub use web_grants::{
     builtin_role_id, builtin_roles, AuthzSnapshot, ConnectionAuthzPolicy, DataRole, StoredGrant, UserGroup,
     GRANT_INVALID, GRANT_NOT_FOUND, GROUP_NAME_TAKEN, GROUP_NOT_FOUND, ROLE_IN_USE, ROLE_NAME_TAKEN, ROLE_NOT_FOUND,
 };
+pub use web_mfa::{UserMfa, MFA_NAMESPACE};
 pub use web_users::{NewWebUser, WebSession, WebUser, LAST_ADMIN, USERNAME_TAKEN, USER_NOT_FOUND};
 
 use std::collections::{HashMap, HashSet};
@@ -3442,6 +3444,7 @@ fn ensure_user_owner_columns_sync(conn: &Connection) -> Result<(), String> {
     const OWNER: &[(&str, &str)] = &[("owner_user_id", "TEXT")];
     ensure_table_columns(conn, "ai_conversations", OWNER)?;
     ensure_table_columns(conn, "tab_runtime_cache", OWNER)?;
+    ensure_table_columns(conn, "users", &[("mfa_enabled", "INTEGER NOT NULL DEFAULT 0")])?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_ai_conversations_owner ON ai_conversations(owner_user_id, updated_at);
          CREATE INDEX IF NOT EXISTS idx_tab_runtime_cache_owner_user ON tab_runtime_cache(owner_user_id);",

@@ -18,6 +18,7 @@ pub struct WebUser {
     pub active: bool,
     pub must_change_password: bool,
     pub mfa_required: bool,
+    pub mfa_enabled: bool,
     pub identity_provider: String,
     pub last_login_at: Option<i64>,
     pub created_at: i64,
@@ -75,10 +76,18 @@ pub(super) const WEB_USER_SCHEMA_STATEMENTS: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_user_sessions_last_seen ON user_sessions(last_seen_at)",
+    "CREATE TABLE IF NOT EXISTS user_mfa (
+        user_id TEXT PRIMARY KEY,
+        totp_secret_enc TEXT,
+        pending_secret_enc TEXT,
+        recovery_codes TEXT NOT NULL DEFAULT '[]',
+        enabled_at INTEGER,
+        last_used_step INTEGER NOT NULL DEFAULT 0
+    )",
 ];
 
 const USER_COLUMNS: &str = "id, username, display_name, password_hash, platform_role, status, must_change_password, \
-     mfa_required, identity_provider, last_login_at, created_at, updated_at";
+     mfa_required, identity_provider, last_login_at, created_at, updated_at, mfa_enabled";
 
 const SESSION_COLUMNS: &str =
     "token_hash, user_id, created_at, last_seen_at, expires_at, revoked_at, ip, user_agent, mfa_verified";
@@ -99,6 +108,7 @@ fn user_from_row(row: &Row<'_>) -> rusqlite::Result<WebUser> {
         last_login_at: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+        mfa_enabled: row.get::<_, i64>(12)? != 0,
     })
 }
 
@@ -171,6 +181,7 @@ impl Storage {
             active: true,
             must_change_password: user.must_change_password,
             mfa_required: false,
+            mfa_enabled: false,
             identity_provider: "local".to_string(),
             last_login_at: None,
             created_at: now,
@@ -323,6 +334,7 @@ impl Storage {
                 .execute("DELETE FROM grants WHERE principal_kind = 'user' AND principal_id = ?1", params![id])
                 .map_err(sql_error)?;
             transaction.execute("DELETE FROM user_group_members WHERE user_id = ?1", params![id]).map_err(sql_error)?;
+            transaction.execute("DELETE FROM user_mfa WHERE user_id = ?1", params![id]).map_err(sql_error)?;
             let changed = transaction.execute("DELETE FROM users WHERE id = ?1", params![id]).map_err(sql_error)?;
             if changed == 0 {
                 return Err(USER_NOT_FOUND.to_string());

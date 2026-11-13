@@ -63,6 +63,8 @@ pub struct SessionUser {
     pub display_name: Option<String>,
     pub role: PlatformRole,
     pub must_change_password: bool,
+    pub mfa_setup_required: bool,
+    pub mfa_enabled: bool,
     pub token_hash: String,
 }
 
@@ -74,6 +76,8 @@ impl SessionUser {
             display_name: user.display_name.clone(),
             role: user.role,
             must_change_password: user.must_change_password,
+            mfa_setup_required: user.mfa_required && !user.mfa_enabled,
+            mfa_enabled: user.mfa_enabled,
             token_hash,
         }
     }
@@ -113,6 +117,7 @@ impl SessionManager {
         user: &WebUser,
         ip: Option<String>,
         user_agent: Option<String>,
+        mfa_verified: bool,
         now: i64,
     ) -> Result<(String, SessionUser), String> {
         let raw = generate_token()?;
@@ -128,7 +133,7 @@ impl SessionManager {
                 revoked_at: None,
                 ip,
                 user_agent,
-                mfa_verified: false,
+                mfa_verified,
             })
             .await?;
         let session_user = SessionUser::from_user(user, token_hash.clone());
@@ -291,7 +296,8 @@ mod tests {
     async fn sessions_survive_a_restart_and_store_only_the_hash() {
         let (_directory, storage, user) = storage_with_user().await;
         let manager = SessionManager::new(SessionConfig::default());
-        let (raw, created) = manager.create(&storage, &user, Some("10.0.0.1".into()), None, 1_000).await.unwrap();
+        let (raw, created) =
+            manager.create(&storage, &user, Some("10.0.0.1".into()), None, false, 1_000).await.unwrap();
         assert!(storage.find_web_session(&raw).await.unwrap().is_none());
         assert!(storage.find_web_session(&created.token_hash).await.unwrap().is_some());
 
@@ -306,7 +312,7 @@ mod tests {
     async fn idle_sessions_expire_and_activity_extends_them() {
         let (_directory, storage, user) = storage_with_user().await;
         let manager = SessionManager::new(SessionConfig::from_values(Some("120"), Some("0")));
-        let (raw, _) = manager.create(&storage, &user, None, None, 0).await.unwrap();
+        let (raw, _) = manager.create(&storage, &user, None, None, false, 0).await.unwrap();
         assert!(manager.validate(&storage, &raw, 90 * MINUTE).await.is_some());
         assert!(manager.validate(&storage, &raw, 200 * MINUTE).await.is_some());
         assert!(manager.validate(&storage, &raw, 321 * MINUTE).await.is_none());
@@ -316,7 +322,7 @@ mod tests {
     async fn activity_is_persisted_so_a_restart_keeps_the_idle_window() {
         let (_directory, storage, user) = storage_with_user().await;
         let manager = SessionManager::new(SessionConfig::from_values(Some("120"), Some("0")));
-        let (raw, _) = manager.create(&storage, &user, None, None, 0).await.unwrap();
+        let (raw, _) = manager.create(&storage, &user, None, None, false, 0).await.unwrap();
         assert!(manager.validate(&storage, &raw, 100 * MINUTE).await.is_some());
         let restarted = SessionManager::new(SessionConfig::from_values(Some("120"), Some("0")));
         assert!(restarted.validate(&storage, &raw, 210 * MINUTE).await.is_some());
@@ -326,7 +332,7 @@ mod tests {
     async fn absolute_lifetime_ends_even_an_active_session() {
         let (_directory, storage, user) = storage_with_user().await;
         let manager = SessionManager::new(SessionConfig::default());
-        let (raw, _) = manager.create(&storage, &user, None, None, 0).await.unwrap();
+        let (raw, _) = manager.create(&storage, &user, None, None, false, 0).await.unwrap();
         for minute in (30..240).step_by(30) {
             assert!(manager.validate(&storage, &raw, minute * MINUTE).await.is_some(), "minute {minute}");
         }
@@ -339,9 +345,9 @@ mod tests {
     async fn revoked_and_disabled_users_lose_access() {
         let (_directory, storage, user) = storage_with_user().await;
         let manager = SessionManager::new(SessionConfig::default());
-        let (first, first_user) = manager.create(&storage, &user, None, None, 0).await.unwrap();
-        let (second, _) = manager.create(&storage, &user, None, None, 0).await.unwrap();
-        let (third, _) = manager.create(&storage, &user, None, None, 0).await.unwrap();
+        let (first, first_user) = manager.create(&storage, &user, None, None, false, 0).await.unwrap();
+        let (second, _) = manager.create(&storage, &user, None, None, false, 0).await.unwrap();
+        let (third, _) = manager.create(&storage, &user, None, None, false, 0).await.unwrap();
 
         manager.revoke(&storage, &third, 1).await.unwrap();
         assert!(manager.validate(&storage, &third, 2).await.is_none());
@@ -359,7 +365,7 @@ mod tests {
     async fn purge_drops_dead_sessions_from_storage() {
         let (_directory, storage, user) = storage_with_user().await;
         let manager = SessionManager::new(SessionConfig::default());
-        let (_raw, created) = manager.create(&storage, &user, None, None, 0).await.unwrap();
+        let (_raw, created) = manager.create(&storage, &user, None, None, false, 0).await.unwrap();
         assert_eq!(manager.purge(&storage, HOUR).await.unwrap(), 0);
         assert_eq!(manager.purge(&storage, 5 * HOUR).await.unwrap(), 1);
         assert!(storage.find_web_session(&created.token_hash).await.unwrap().is_none());

@@ -25,6 +25,8 @@ pub struct UserSummary {
     pub role: PlatformRole,
     pub active: bool,
     pub must_change_password: bool,
+    pub mfa_enabled: bool,
+    pub mfa_required: bool,
     pub last_login_at: Option<i64>,
     pub created_at: i64,
 }
@@ -38,6 +40,8 @@ impl From<WebUser> for UserSummary {
             role: user.role,
             active: user.active,
             must_change_password: user.must_change_password,
+            mfa_enabled: user.mfa_enabled,
+            mfa_required: user.mfa_required,
             last_login_at: user.last_login_at,
             created_at: user.created_at,
         }
@@ -188,6 +192,14 @@ pub async fn create(
         .await
         .map_err(AdminError::storage)?;
     log::info!("Created DBX Web user '{}' ({})", user.username, user.role.as_str());
+    let required_all =
+        state.app.storage.authz_flag(crate::routes::mfa::MFA_REQUIRED_ALL_FLAG).await.map_err(AdminError::storage)?;
+    let user = if required_all {
+        state.app.storage.set_web_user_mfa_required(&user.id, true, now_millis()).await.map_err(AdminError::storage)?;
+        WebUser { mfa_required: true, ..user }
+    } else {
+        user
+    };
     record_action(
         &state,
         &admin.0,
@@ -277,4 +289,87 @@ pub async fn delete(
         log::error!("Failed to reload DBX Web permissions after deleting a user: {error}");
     }
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct MfaRequiredRequest {
+    pub id: String,
+    pub required: bool,
+}
+
+pub async fn reset_mfa(
+    State(state): State<Arc<WebState>>,
+    admin: CurrentUser,
+    Json(body): Json<UserIdRequest>,
+) -> AdminResult {
+    reject_self(&admin, &body.id)?;
+    let summary = load_summary(&state, &body.id).await?;
+    state.app.storage.disable_mfa(&body.id, now_millis()).await.map_err(AdminError::storage)?;
+    end_all_sessions(&state, &body.id).await;
+    record_action(
+        &state,
+        &admin.0,
+        "user_mfa_reset",
+        serde_json::json!({ "user_id": body.id, "username": summary.username }),
+    );
+    Ok(Json(load_summary(&state, &body.id).await?).into_response())
+}
+
+pub async fn set_mfa_required(
+    State(state): State<Arc<WebState>>,
+    admin: CurrentUser,
+    Json(body): Json<MfaRequiredRequest>,
+) -> AdminResult {
+    state
+        .app
+        .storage
+        .set_web_user_mfa_required(&body.id, body.required, now_millis())
+        .await
+        .map_err(AdminError::storage)?;
+    state.session_manager.forget_user(&body.id).await;
+    let summary = load_summary(&state, &body.id).await?;
+    record_action(
+        &state,
+        &admin.0,
+        "user_mfa_required_changed",
+        serde_json::json!({ "user_id": body.id, "username": summary.username, "required": body.required }),
+    );
+    Ok(Json(summary).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct MfaPolicyRequest {
+    pub required_all: bool,
+}
+
+pub async fn mfa_policy(State(state): State<Arc<WebState>>, _admin: CurrentUser) -> AdminResult {
+    let required_all =
+        state.app.storage.authz_flag(crate::routes::mfa::MFA_REQUIRED_ALL_FLAG).await.map_err(AdminError::storage)?;
+    Ok(Json(serde_json::json!({ "required_all": required_all })).into_response())
+}
+
+pub async fn set_mfa_policy(
+    State(state): State<Arc<WebState>>,
+    admin: CurrentUser,
+    Json(body): Json<MfaPolicyRequest>,
+) -> AdminResult {
+    let storage = &state.app.storage;
+    let flag = crate::routes::mfa::MFA_REQUIRED_ALL_FLAG;
+    if body.required_all {
+        storage.set_authz_flag(flag).await.map_err(AdminError::storage)?;
+    } else {
+        storage.clear_authz_flag(flag).await.map_err(AdminError::storage)?;
+    }
+    let changed =
+        storage.set_all_web_users_mfa_required(body.required_all, now_millis()).await.map_err(AdminError::storage)?;
+    for user in storage.list_web_users().await.map_err(AdminError::storage)? {
+        state.session_manager.forget_user(&user.id).await;
+    }
+    record_action(
+        &state,
+        &admin.0,
+        "mfa_policy_changed",
+        serde_json::json!({ "required_all": body.required_all, "users_changed": changed }),
+    );
+    Ok(Json(serde_json::json!({ "required_all": body.required_all })).into_response())
 }

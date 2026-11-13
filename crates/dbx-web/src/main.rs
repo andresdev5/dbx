@@ -7,6 +7,7 @@ mod demo;
 mod engine_access;
 mod error;
 mod identity;
+mod mfa;
 mod request_context;
 mod route_policy;
 mod routes;
@@ -236,8 +237,10 @@ async fn rotate_secret_key_if_requested(storage: &Storage) {
         ),
         Ok(report) => {
             log::info!(
-                "Rotated the DBX secret key: {} connection secrets and {} audited statements re-encrypted; backup at {}",
+                "Rotated the DBX secret key: {} connection secrets, {} two-factor secrets and {} audited statements \
+                 re-encrypted; backup at {}",
                 report.connection_secrets,
+                report.mfa_secrets,
                 report.audit_statements,
                 report.backup_path.as_deref().map(|path| path.display().to_string()).unwrap_or_default()
             );
@@ -738,6 +741,7 @@ async fn serve() -> Result<(), String> {
         managed_sql_previews: Default::default(),
         nacos_imports: RwLock::new(HashMap::new()),
         login_throttle: tokio::sync::Mutex::new(state::LoginThrottle::default()),
+        mfa_challenges: tokio::sync::Mutex::new(state::MfaChallenges::default()),
         captchas: captcha::CaptchaStore::new(),
         captcha_mode: tokio::sync::RwLock::new(captcha_mode),
         captcha_env_locked,
@@ -796,6 +800,19 @@ async fn serve() -> Result<(), String> {
         .route("/admin/users/set-active", post(routes::admin_users::set_active))
         .route("/admin/users/reset-password", post(routes::admin_users::reset_password))
         .route("/admin/users/delete", post(routes::admin_users::delete))
+        .route("/admin/users/reset-mfa", post(routes::admin_users::reset_mfa))
+        .route("/admin/users/set-mfa-required", post(routes::admin_users::set_mfa_required))
+        .route("/admin/users/mfa-policy", post(routes::admin_users::mfa_policy))
+        .route("/admin/users/mfa-policy/save", post(routes::admin_users::set_mfa_policy))
+        .route("/auth/mfa/verify", post(routes::mfa::verify_login).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)))
+        .route("/auth/mfa/status", post(routes::mfa::status))
+        .route("/auth/mfa/setup", post(routes::mfa::setup))
+        .route("/auth/mfa/confirm", post(routes::mfa::confirm).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)))
+        .route("/auth/mfa/disable", post(routes::mfa::disable).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)))
+        .route(
+            "/auth/mfa/recovery-codes",
+            post(routes::mfa::regenerate_recovery_codes).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)),
+        )
         .route("/admin/groups/list", post(routes::admin_access::list_groups))
         .route("/admin/groups/create", post(routes::admin_access::create_group))
         .route("/admin/groups/update", post(routes::admin_access::update_group))

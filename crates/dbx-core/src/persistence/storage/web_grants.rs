@@ -659,6 +659,14 @@ impl Storage {
         .await
     }
 
+    pub async fn clear_authz_flag(&self, key: &str) -> Result<(), String> {
+        let key = format!("authz_flag:{key}");
+        self.with_conn(move |conn| {
+            conn.execute("DELETE FROM app_state WHERE key = ?1", params![key]).map(|_| ()).map_err(sql_error)
+        })
+        .await
+    }
+
     pub async fn set_authz_flag(&self, key: &str) -> Result<(), String> {
         let key = format!("authz_flag:{key}");
         self.with_conn(move |conn| {

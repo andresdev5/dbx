@@ -1,5 +1,8 @@
 use super::*;
 use crate::audit::{AuditEvent, AUDIT_DIGEST_LABEL, AUDIT_NAMESPACE};
+use crate::persistence::storage::MFA_NAMESPACE;
+
+const MFA_SECRET_COLUMNS: [&str; 2] = ["totp_secret_enc", "pending_secret_enc"];
 
 const AUDIT_ROTATION_BATCH: i64 = 1_000;
 
@@ -7,13 +10,14 @@ const AUDIT_ROTATION_BATCH: i64 = 1_000;
 pub struct KeyRotationReport {
     pub backup_path: Option<PathBuf>,
     pub connection_secrets: usize,
+    pub mfa_secrets: usize,
     pub audit_statements: usize,
     pub unreadable_audit_statements: usize,
 }
 
 impl KeyRotationReport {
     pub fn rotated_anything(&self) -> bool {
-        self.connection_secrets > 0 || self.audit_statements > 0
+        self.connection_secrets > 0 || self.mfa_secrets > 0 || self.audit_statements > 0
     }
 }
 
@@ -46,6 +50,22 @@ fn load_connection_secrets(conn: &Connection) -> Result<Vec<(String, String, Str
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string());
     rows
+}
+
+fn load_mfa_secrets(conn: &Connection) -> Result<Vec<(String, &'static str, String)>, String> {
+    let mut secrets = Vec::new();
+    for column in MFA_SECRET_COLUMNS {
+        let mut statement = conn
+            .prepare(&format!("SELECT user_id, {column} FROM user_mfa WHERE {column} IS NOT NULL"))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        secrets.extend(rows.into_iter().map(|(user_id, envelope)| (user_id, column, envelope)));
+    }
+    Ok(secrets)
 }
 
 fn load_audit_batch(conn: &Connection, after_id: i64) -> Result<Vec<(i64, String, String)>, String> {
@@ -96,6 +116,13 @@ fn plan_rotation(conn: &Connection, current: &SecretCodec, previous: &SecretCode
             Readable::Neither => plan.unreadable_secrets += 1,
         }
     }
+    for (user_id, _, envelope) in load_mfa_secrets(conn)? {
+        match classify(current, previous, MFA_NAMESPACE, &user_id, &envelope) {
+            Readable::Current => {}
+            Readable::Previous(_) => plan.secrets += 1,
+            Readable::Neither => plan.unreadable_secrets += 1,
+        }
+    }
     plan.audit = audit_needs_rotation(conn, current, previous)?;
     Ok(plan)
 }
@@ -104,9 +131,10 @@ fn rotate_connection_secrets(
     conn: &mut Connection,
     current: &SecretCodec,
     previous: &SecretCodec,
-) -> Result<usize, String> {
+) -> Result<(usize, usize), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
     let mut rotated = 0;
+    let mut mfa_rotated = 0;
     for (namespace, key, envelope) in load_connection_secrets(&tx)? {
         match classify(current, previous, &namespace, &key, &envelope) {
             Readable::Current => {}
@@ -122,8 +150,23 @@ fn rotate_connection_secrets(
             Readable::Neither => return Err("SECRET_KEY_ROTATION_UNREADABLE".to_string()),
         }
     }
+    for (user_id, column, envelope) in load_mfa_secrets(&tx)? {
+        match classify(current, previous, MFA_NAMESPACE, &user_id, &envelope) {
+            Readable::Current => {}
+            Readable::Previous(plaintext) => {
+                let encrypted = current.encrypt(MFA_NAMESPACE, &user_id, &plaintext)?;
+                tx.execute(
+                    &format!("UPDATE user_mfa SET {column} = ?2 WHERE user_id = ?1"),
+                    params![user_id, encrypted],
+                )
+                .map_err(|error| error.to_string())?;
+                mfa_rotated += 1;
+            }
+            Readable::Neither => return Err("SECRET_KEY_ROTATION_UNREADABLE".to_string()),
+        }
+    }
     tx.commit().map_err(|error| error.to_string())?;
-    Ok(rotated)
+    Ok((rotated, mfa_rotated))
 }
 
 fn rotate_audit_statements(
@@ -195,7 +238,7 @@ impl Storage {
             }
         }
 
-        let connection_secrets =
+        let (connection_secrets, mfa_secrets) =
             self.with_conn(move |conn| rotate_connection_secrets(conn, &current, &previous)).await?;
         self.validate_existing_encrypted_data(current)
             .await
@@ -206,11 +249,13 @@ impl Storage {
         let report = KeyRotationReport {
             backup_path: Some(backup),
             connection_secrets,
+            mfa_secrets,
             audit_statements,
             unreadable_audit_statements,
         };
         let event = AuditEvent::new("secret_key_rotated").reason("previous_key_supplied").detail(serde_json::json!({
             "connection_secrets": report.connection_secrets,
+            "mfa_secrets": report.mfa_secrets,
             "audit_statements": report.audit_statements,
             "unreadable_audit_statements": report.unreadable_audit_statements,
         }));
@@ -263,6 +308,14 @@ mod tests {
             })
             .await
             .unwrap();
+        let mfa = codec.encrypt(MFA_NAMESPACE, "user-1", "TOTPSECRET").unwrap();
+        storage
+            .with_conn(move |conn| {
+                conn.execute("INSERT INTO user_mfa (user_id, totp_secret_enc) VALUES ('user-1', ?1)", params![mfa])
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
         let event = AuditEvent::new("sql").statement("DELETE FROM accounts");
         let event_id = event.event_id.clone();
         storage.insert_audit_events(vec![event]).await.unwrap();
@@ -297,6 +350,7 @@ mod tests {
 
         let report = storage.rotate_secret_key(SecretCodec::new(OLD_KEY)).await.unwrap();
         assert_eq!(report.connection_secrets, 2);
+        assert_eq!(report.mfa_secrets, 1);
         assert_eq!(report.audit_statements, 1);
         assert_eq!(report.unreadable_audit_statements, 0);
         let backup = report.backup_path.unwrap();
@@ -312,6 +366,7 @@ mod tests {
             "api-token"
         );
         assert_eq!(storage.reveal_audit_statement(&event_id).await.unwrap().as_deref(), Some("DELETE FROM accounts"));
+        assert_eq!(storage.load_mfa_secret("user-1").await.unwrap().as_deref(), Some("TOTPSECRET"));
         let new_digest = storage.audit_statement_digest("DELETE FROM accounts").unwrap();
         assert_ne!(new_digest, old_digest);
         let found = storage

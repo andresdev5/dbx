@@ -20,6 +20,7 @@ pub mod history;
 pub mod jdbc;
 pub mod layout;
 pub mod mcp_policy;
+pub mod mfa;
 pub mod migration;
 pub mod mongo;
 pub mod mongodb_dump;

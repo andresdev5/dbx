@@ -78,6 +78,10 @@ pub async fn bootstrap_users(storage: &Storage, env: &BootstrapEnv, now: i64) ->
             storage.set_web_user_password(&user.id, &hash, false, now).await?;
             storage.set_web_user_active(&user.id, true, now).await?;
             storage.revoke_web_user_sessions(&user.id, None, now).await?;
+            if user.mfa_enabled {
+                storage.disable_mfa(&user.id, now).await?;
+                log::warn!("DBX_ADMIN_RESET removed the two-factor setup of '{}'", user.username);
+            }
             log::warn!("DBX_ADMIN_RESET reset the password of '{}'", user.username);
             if user.role != PlatformRole::Admin {
                 log::warn!("DBX_ADMIN_RESET target '{}' is not an administrator", user.username);

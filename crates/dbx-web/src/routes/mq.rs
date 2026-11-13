@@ -1625,6 +1625,7 @@ mod tests {
             managed_sql_previews: Default::default(),
             nacos_imports: RwLock::new(HashMap::new()),
             login_throttle: Mutex::new(LoginThrottle::default()),
+            mfa_challenges: Mutex::new(crate::state::MfaChallenges::default()),
             captchas: crate::captcha::CaptchaStore::new(),
             captcha_mode: tokio::sync::RwLock::new(crate::captcha::CaptchaMode::Auto),
             captcha_env_locked: false,

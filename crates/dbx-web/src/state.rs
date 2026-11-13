@@ -20,6 +20,52 @@ struct LoginAttempts {
     last_failure: Option<std::time::Instant>,
 }
 
+pub const MFA_CHALLENGE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+pub const MFA_CHALLENGE_MAX_FAILURES: u8 = 5;
+
+#[derive(Debug, Clone)]
+pub struct MfaChallenge {
+    pub user_id: String,
+    pub created_at: std::time::Instant,
+    pub failures: u8,
+}
+
+#[derive(Debug, Default)]
+pub struct MfaChallenges {
+    entries: HashMap<String, MfaChallenge>,
+}
+
+impl MfaChallenges {
+    pub fn issue(&mut self, token_hash: String, user_id: String, now: std::time::Instant) {
+        self.entries.retain(|_, challenge| now.duration_since(challenge.created_at) < MFA_CHALLENGE_TTL);
+        self.entries.insert(token_hash, MfaChallenge { user_id, created_at: now, failures: 0 });
+    }
+
+    pub fn get(&self, token_hash: &str, now: std::time::Instant) -> Option<MfaChallenge> {
+        self.entries
+            .get(token_hash)
+            .filter(|challenge| now.duration_since(challenge.created_at) < MFA_CHALLENGE_TTL)
+            .cloned()
+    }
+
+    pub fn record_failure(&mut self, token_hash: &str) {
+        let exhausted = match self.entries.get_mut(token_hash) {
+            Some(challenge) => {
+                challenge.failures += 1;
+                challenge.failures >= MFA_CHALLENGE_MAX_FAILURES
+            }
+            None => false,
+        };
+        if exhausted {
+            self.entries.remove(token_hash);
+        }
+    }
+
+    pub fn remove(&mut self, token_hash: &str) {
+        self.entries.remove(token_hash);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LoginThrottle {
     entries: HashMap<String, LoginAttempts>,
@@ -114,6 +160,7 @@ pub struct WebState {
     pub managed_sql_previews: crate::routes::sql_file::ManagedSqlPreviews,
     pub nacos_imports: RwLock<HashMap<String, NacosImportContext>>,
     pub login_throttle: Mutex<LoginThrottle>,
+    pub mfa_challenges: Mutex<MfaChallenges>,
     /// Single-use image challenges gating `auth::login`.
     pub captchas: crate::captcha::CaptchaStore,
     /// When `auth::login` demands a challenge. Editable from `设置 → 安全`
@@ -162,6 +209,7 @@ impl WebState {
             managed_sql_previews: Default::default(),
             nacos_imports: RwLock::new(HashMap::new()),
             login_throttle: Mutex::new(LoginThrottle::default()),
+            mfa_challenges: Mutex::new(MfaChallenges::default()),
             captchas: crate::captcha::CaptchaStore::new(),
             captcha_mode: tokio::sync::RwLock::new(crate::captcha::CaptchaMode::Auto),
             captcha_env_locked: false,
