@@ -200,6 +200,44 @@ async fn web_mcp_demo_gate(
     next.run(request).await
 }
 
+async fn rotate_secret_key_if_requested(storage: &Storage) {
+    let previous = match dbx_core::persistence::secret_codec::SecretCodec::previous_from_env() {
+        Ok(Some(previous)) => previous,
+        Ok(None) => return,
+        Err(error) => {
+            log::error!("DBX_SECRET_KEY_PREVIOUS could not be read ({error}); refusing to start");
+            std::process::exit(1);
+        }
+    };
+    match storage.rotate_secret_key(previous).await {
+        Ok(report) if !report.rotated_anything() => log::warn!(
+            "DBX_SECRET_KEY_PREVIOUS is set but everything already uses the current key; remove it from the environment"
+        ),
+        Ok(report) => {
+            log::info!(
+                "Rotated the DBX secret key: {} connection secrets and {} audited statements re-encrypted; backup at {}",
+                report.connection_secrets,
+                report.audit_statements,
+                report.backup_path.as_deref().map(|path| path.display().to_string()).unwrap_or_default()
+            );
+            if report.unreadable_audit_statements > 0 {
+                log::warn!(
+                    "{} audited statements could not be read with either key and were left as they were",
+                    report.unreadable_audit_statements
+                );
+            }
+            log::warn!("Remove DBX_SECRET_KEY_PREVIOUS once you have checked the rotation");
+        }
+        Err(error) => {
+            log::error!(
+                "Rotating the DBX secret key failed ({error}); refusing to start. The rotation can be retried, and a \
+                 dbx-key-rotation-* backup in the data directory holds the database as it was before"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 fn start_session_purge(state: &Arc<WebState>) {
     let state = Arc::downgrade(state);
     tokio::spawn(async move {
@@ -562,6 +600,7 @@ async fn serve() -> Result<(), String> {
             .await
             .expect("Failed to open storage")
             .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
+        rotate_secret_key_if_requested(&storage).await;
 
         // Initialize core dialect registry and load external plugin dialects
         register_core_dialects();

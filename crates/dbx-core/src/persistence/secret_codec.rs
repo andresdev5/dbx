@@ -351,6 +351,32 @@ impl SecretCodec {
         Ok(format!("{PREFIX}.{}.{}", b64.encode(nonce), b64.encode(ciphertext)))
     }
 
+    pub fn same_key_as(&self, other: &Self) -> bool {
+        self.key.iter().zip(other.key.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    }
+
+    pub fn previous_from_env() -> Result<Option<Self>, String> {
+        Self::previous_from_lookup(|name| std::env::var_os(name))
+    }
+
+    pub fn previous_from_lookup<F>(env_lookup: F) -> Result<Option<Self>, String>
+    where
+        F: Fn(&str) -> Option<std::ffi::OsString>,
+    {
+        if let Some(path) = env_lookup("DBX_SECRET_KEY_PREVIOUS_FILE") {
+            return Self::read_key_file(std::path::Path::new(&path), false)
+                .map(Some)
+                .map_err(|_| "PREVIOUS_SECRET_KEY_INVALID".to_string());
+        }
+        match env_lookup("DBX_SECRET_KEY_PREVIOUS") {
+            None => Ok(None),
+            Some(value) => {
+                let value = value.to_str().ok_or_else(|| "PREVIOUS_SECRET_KEY_INVALID".to_string())?;
+                Self::from_key_material(value.trim()).map(Some).map_err(|_| "PREVIOUS_SECRET_KEY_INVALID".to_string())
+            }
+        }
+    }
+
     pub fn keyed_digest(&self, label: &str, message: &str) -> String {
         use hmac::{Hmac, Mac};
         type HmacSha256 = Hmac<sha2::Sha256>;

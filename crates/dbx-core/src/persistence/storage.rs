@@ -65,6 +65,9 @@ use crate::saved_sql::{SavedSqlFile, SavedSqlFolder, SavedSqlLibrary};
 #[path = "credential_reset.rs"]
 mod credential_reset;
 pub use credential_reset::{CredentialResetFailure, CredentialResetPreparation, CredentialResetReport};
+#[path = "key_rotation.rs"]
+mod key_rotation;
+pub use key_rotation::KeyRotationReport;
 
 const SSH_TUNNEL_SECRET_PREFIX: &str = "ssh_tunnels.";
 const TRANSPORT_LAYER_SECRET_PREFIX: &str = "transport_layers.";
