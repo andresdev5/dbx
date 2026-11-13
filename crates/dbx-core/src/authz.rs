@@ -414,6 +414,24 @@ pub async fn authorize_connection_operations(
     }
 }
 
+pub async fn authorize_any_write(state: &AppState, connection_id: &str) -> Result<(), String> {
+    let principal = match state.authz.current() {
+        CurrentPrincipal::Unenforced => return Ok(()),
+        CurrentPrincipal::Background | CurrentPrincipal::Unknown => return Err(missing_principal()),
+        CurrentPrincipal::Known(principal) => principal,
+    };
+    let Some(config) = connection_config(state, connection_id).await else {
+        return Err(format!("{PERMISSION_DENIED_PREFIX} unknown connection"));
+    };
+    let permissions = principal_permissions(state, &principal, &config).await;
+    let requirement = Requirement::single(Need::any_write_within(Resource::connection(config.id.clone())));
+    let decision = permissions.authorize(&requirement);
+    match denial_message(&decision) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
 pub async fn principal_allows(
     state: &AppState,
     principal: &Principal,
@@ -786,6 +804,44 @@ mod tests {
         assert_eq!(update.rows_affected, Some(1));
         let delete = rows.iter().find(|row| row.operations == Some(Operations::DELETE)).unwrap();
         assert_eq!(delete.rows_affected, Some(2));
+    }
+
+    #[tokio::test]
+    async fn admin_clients_that_skip_the_pool_still_require_connection_access() {
+        let (_root, state) = state(false).await;
+        let mut nacos: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "nacos-prod", "name": "Nacos", "db_type": "nacos", "host": "127.0.0.1",
+            "port": 8848, "username": "", "password": "", "database": null,
+            "one_time": false, "save_password": false, "read_only": false
+        }))
+        .unwrap();
+        nacos.external_config = Some(serde_json::json!({
+            "serverAddr": "http://127.0.0.1:8848",
+            "auth": { "kind": "none" }
+        }));
+        state.configs.write().await.insert(nacos.id.clone(), nacos.clone());
+        enforce(
+            &state,
+            vec![grant(
+                "r",
+                Subject::User("ana".into()),
+                Scope::Resource(Resource::connection("nacos-prod")),
+                Effect::Allow,
+                BuiltinRole::Reader.operations(),
+            )],
+            &[],
+        );
+        let as_owner = |owner: &'static str| {
+            let state = &state;
+            let nacos = nacos.clone();
+            async move {
+                with_credential_owner(Some(owner.into()), state.nacos_admin_config_for_connection("nacos-prod", &nacos))
+                    .await
+            }
+        };
+        let denied = as_owner("bob-token").await.unwrap_err();
+        assert!(denied.contains("no access to connection Nacos"), "{denied}");
+        assert!(as_owner("ana-token").await.is_ok());
     }
 
     #[tokio::test]

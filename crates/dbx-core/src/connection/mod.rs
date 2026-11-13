@@ -5260,6 +5260,7 @@ impl AppState {
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<crate::mq::config::MqAdminConfig, String> {
+        crate::authz::authorize_connection_access(self, connection_id).await?;
         let mut normalized = config.clone();
         connection_secrets::normalize_rocketmq_credentials(&mut normalized);
         let mut mqc = crate::mq::config::MqAdminConfig::from_connection(&normalized)?;
@@ -5371,6 +5372,7 @@ impl AppState {
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<crate::nacos::config::NacosAdminConfig, String> {
+        crate::authz::authorize_connection_access(self, connection_id).await?;
         let mut nacos_config = crate::nacos::config::NacosAdminConfig::from_connection(config)?;
         if !config.save_password {
             let owner = crate::session_credentials::current_credential_owner().unwrap_or_default();
