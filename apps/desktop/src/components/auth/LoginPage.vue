@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
+import ExternalCaptcha from "@/components/auth/captcha/ExternalCaptcha.vue";
+import { isExternalCaptcha, type ExternalCaptchaChallenge } from "@/lib/auth/externalCaptcha";
 import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,6 +31,9 @@ const captchaRequired = ref(false);
 const captchaId = ref("");
 const captchaImage = ref("");
 const captchaLoading = ref(false);
+const externalCaptcha = ref<ExternalCaptchaChallenge | null>(null);
+const captchaToken = ref("");
+const captchaRenderKey = ref(0);
 const error = ref("");
 const loading = ref(false);
 const mfaChallenge = ref("");
@@ -65,6 +70,8 @@ async function refreshCaptcha() {
     const query = name ? `?username=${encodeURIComponent(name)}` : "";
     const res = await fetch(apiUrl(`/api/auth/captcha${query}`), { headers: { Accept: "application/json" } });
     if (res.status === 204) {
+      externalCaptcha.value = null;
+      captchaToken.value = "";
       captchaRequired.value = false;
       captchaId.value = "";
       captchaImage.value = "";
@@ -73,6 +80,16 @@ async function refreshCaptcha() {
     }
     if (!res.ok) throw new Error(String(res.status));
     const body = (await res.json()) as { id?: string; image?: string };
+    if (isExternalCaptcha(body)) {
+      externalCaptcha.value = body;
+      captchaToken.value = "";
+      captchaRenderKey.value += 1;
+      captchaRequired.value = true;
+      captchaId.value = "";
+      captchaImage.value = "";
+      return;
+    }
+    externalCaptcha.value = null;
     if (body.id && body.image) {
       captchaRequired.value = true;
       captchaId.value = body.id;
@@ -94,7 +111,7 @@ async function submit() {
     error.value = t("auth.passwordMismatch");
     return;
   }
-  if (!props.setupMode && captchaRequired.value && !captchaId.value) {
+  if (!props.setupMode && captchaRequired.value && !externalCaptcha.value && !captchaId.value) {
     error.value = t("auth.captchaFailed");
     await refreshCaptcha();
     return;
@@ -107,9 +124,11 @@ async function submit() {
     const name = username.value.trim();
     const payload = props.setupMode
       ? { setup_token: setupToken.value.trim(), username: name, password: password.value }
-      : captchaRequired.value
-        ? { username: name, password: password.value, captcha_id: captchaId.value, captcha_code: captchaCode.value }
-        : { username: name, password: password.value };
+      : captchaRequired.value && externalCaptcha.value
+        ? { username: name, password: password.value, captcha_token: captchaToken.value }
+        : captchaRequired.value
+          ? { username: name, password: password.value, captcha_id: captchaId.value, captcha_code: captchaCode.value }
+          : { username: name, password: password.value };
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -222,7 +241,8 @@ onMounted(() => {
           <Lock class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <PasswordInput v-model="confirmPassword" :placeholder="t('auth.confirmPassword')" inputClass="pl-10 h-11" autocomplete="off" />
         </div>
-        <div v-if="!setupMode && captchaRequired" class="flex items-start gap-2">
+        <ExternalCaptcha v-if="!setupMode && captchaRequired && externalCaptcha" :key="captchaRenderKey" :challenge="externalCaptcha" @token="captchaToken = $event" @failed="error = t('auth.captchaWidgetFailed')" />
+        <div v-else-if="!setupMode && captchaRequired" class="flex items-start gap-2">
           <div class="relative flex-1">
             <ShieldQuestion class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <Input v-model="captchaCode" :placeholder="t('auth.captchaPlaceholder')" class="pl-10 h-11 uppercase tracking-[0.35em]" maxlength="5" autocomplete="off" data-testid="captcha-input" />
@@ -241,7 +261,7 @@ onMounted(() => {
           </button>
         </div>
         <p v-if="error" class="text-sm text-destructive text-center">{{ error }}</p>
-        <Button type="submit" class="w-full h-11 text-sm font-medium" :disabled="loading || !username.trim() || !password || (setupMode && (!confirmPassword || !setupToken.trim())) || (!setupMode && captchaRequired && !captchaCode)">
+        <Button type="submit" class="w-full h-11 text-sm font-medium" :disabled="loading || !username.trim() || !password || (setupMode && (!confirmPassword || !setupToken.trim())) || (!setupMode && captchaRequired && (externalCaptcha ? !captchaToken : !captchaCode))">
           <Loader2 v-if="loading" class="w-4 h-4 animate-spin mr-2" />
           {{ loading ? t("auth.processing") : setupMode ? t("auth.createAdmin") : t("auth.login") }}
         </Button>
